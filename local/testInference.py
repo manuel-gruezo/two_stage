@@ -63,20 +63,16 @@ normalize = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# Tamaño que espera el modelo de pose
-try:
-    img_size = conf.MODEL.IMAGE_SIZE
-    model_w, model_h = int(img_size[0]), int(img_size[1])
-except Exception:
-    model_w, model_h = 512, 384
 
-# Skeleton EXACTO de la clase Visualizer (1-based)
+model_w, model_h = 512, 384
+
+# Skeleton COCO
 SKELETON_1BASED = [[16, 14], [14, 12], [17, 15], [15, 13], [12, 13], [6, 12], [7, 13], 
                    [6, 7], [6, 8], [7, 9], [8, 10], [9, 11], [2, 3], [1, 2], [1, 3], 
                    [2, 4], [3, 5], [4, 6], [5, 7]]
 SKELETON = [[a-1, b-1] for a, b in SKELETON_1BASED]  # Convertir a 0-based
-
-# ---------- Funciones auxiliares iguales que app.py ----------
+print(SKELETON)
+# ---------- Funciones auxiliares  ----------
 def make_meta_from_wh(w, h, use_max_scale=True):
     """
     Calcula metadatos de centro y escala para transformación afín.

@@ -18,7 +18,7 @@ def main():
         sys.exit(1)
     
     # Verificar que el modelo existe
-    model_path = Path("models/pytorch/pose_coco/pose_transformer_hrnet_w32_384x288.pth")
+    model_path = Path("models/pytorch/pose_coco/pose_transformer_hrnet_w32_512x384.pth")
     if not model_path.exists():
         print(" Error: No se encontró el modelo preentrenado")
         print(f"   Ruta esperada: {model_path}")

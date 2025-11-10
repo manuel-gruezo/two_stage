@@ -1,5 +1,4 @@
 /data
-/models
 # IntelliJ project files
 /experiment
 .idea
@@ -87,7 +86,9 @@ target/
 lib/pycocotools/_mask.c
 
 output*/*
-models/*
+models/pytorch/pose_coco/
+models/pytorch/pose_mpii/
+models/detr-resnet-101/
 log*/*
 data/*
 external/
@@ -95,3 +96,5 @@ external/
 draws/
 plot/
 .history*
+
+venv/

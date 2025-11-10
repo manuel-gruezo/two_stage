@@ -8,15 +8,27 @@
 
 **Repositorio original:** [PRTR en GitHub](https://github.com/mlpc-ucsd/PRTR/tree/main)
 
-## Descripción del Modelo y Principales Innovaciones
+## Descripción 
 
-PRTR (Pose Recognition TRansformer) es un método innovador para el reconocimiento de poses humanas que utiliza una arquitectura basada en Transformers en cascada. A diferencia de los enfoques tradicionales basados en heatmaps, PRTR adopta un método de regresión directa que elimina la necesidad de complejos pre-procesamientos y post-procesamientos heurísticos.
+Esta aplicación ofrece una interfaz web (Streamlit) para realizar detección de poses humanas en imágenes utilizando el modelo PRTR (Pose Recognition with Cascade Transformers). Esta técnica detecta personas y estima sus 17 keypoints corporales mediante una arquitectura de Transformers en cascada, permitiendo identificar y analizar poses con alta precisión y eficiencia. A diferencia de los enfoques tradicionales basados en heatmaps, PRTR adopta un método de regresión directa que elimina la necesidad de complejos pre-procesamientos y post-procesamientos heurísticos.
 
-### Innovaciones principales (Two-Stage):
+
+## Interfaz
+
+
+
+## Ejemplos
+
+
+
+
+
+
+### Innovaciones principales:
 
 **Arquitectura Two-Stage en Cascada:**
-- **Person-Detection Transformer**: Detecta personas en la imagen completa usando el mecanismo de matching bipartito de DETR, eliminando la necesidad de NMS (Non-Maximum Suppression) y otros procesamientos intermedios no diferenciables.
-- **Keypoint-Detection Transformer**: Predice los 17 keypoints COCO para cada persona detectada mediante regresión directa de coordenadas, haciendo el pipeline completamente diferenciable.
+- **Person-Detection Transformer (DETR)**: Detecta personas en la imagen completa usando el mecanismo de matching bipartito de DETR. Aunque DETR puede generar detecciones duplicadas, se aplica NMS (Non-Maximum Suppression) para eliminar duplicados y evitar detectar la misma persona múltiples veces.
+- **Keypoint-Detection Transformer (PRTR)**: Predice los 17 keypoints COCO para cada persona detectada mediante regresión directa de coordenadas, haciendo el pipeline completamente diferenciable. Este modelo NO requiere NMS ya que usa Hungarian Matching para asignar queries a keypoints.
 - **Mecanismo de Queries**: 100 queries aprendidas que compiten para predecir los 17 keypoints, asignadas óptimamente mediante Hungarian Matching basado en probabilidad de clase.
 - **Refinamiento Gradual**: Las queries de keypoints se refinan progresivamente a través de las capas del decoder, mejorando iterativamente las predicciones.
 
@@ -28,19 +40,20 @@ PRTR (Pose Recognition TRansformer) es un método innovador para el reconocimien
 
 La arquitectura two-stage de PRTR consiste en:
 
-#### 1. Person-Detection Transformer
+#### 1. Person-Detection Transformer (DETR)
 
 - **Backbone CNN**: Extrae características de la imagen completa
 - **Transformer Encoder-Decoder**: Procesa las características con atención
 - **Salida**: Detecta personas con bounding boxes usando el mecanismo de matching bipartito de DETR
-- **Característica clave**: No requiere NMS, elimina duplicados por diseño
+- **NMS**: Aunque DETR usa matching bipartito, puede generar detecciones duplicadas. Por lo tanto, se aplica NMS (Non-Maximum Suppression) para eliminar duplicados y evitar detectar la misma persona múltiples veces.
 
-#### 2. Keypoint-Detection Transformer
+#### 2. Keypoint-Detection Transformer (PRTR)
 
 - **Input**: Recortes de personas detectadas (expandidos 25% para contexto adicional)
-- **Procesamiento**: Cada recorte se procesa independientemente con transformación afín al tamaño del modelo (512x384)
+- **Procesamiento**: Cada recorte se procesa independientemente con transformación afín al tamaño del modelo (512x384 píxeles, width x height)
 - **Mecanismo de Queries**: 100 queries aprendidas que compiten para predecir los 17 keypoints
-- **Hungarian Matching**: Asigna óptimamente queries a keypoints basado en:
+- **Hungarian Matching**: Asigna óptimamente queries a keypoints usando el algoritmo de asignación lineal (linear_sum_assignment) basado en las probabilidades de clase. Este matching se realiza internamente en `get_final_preds_match()`.
+- **Filtrado Posterior**: Después del Hungarian Matching, se aplican filtros adicionales para validar keypoints:
   - Probabilidad de clase > 30%
   - Distancia espacial < 50 píxeles
   - Confianza del heatmap > 80%
@@ -50,18 +63,12 @@ La arquitectura two-stage de PRTR consiste en:
 
 1. **Detección**: El Person-Detection Transformer identifica todas las personas en la imagen
 2. **Recorte**: Cada detección se expande un 25% y se recorta
-3. **Normalización**: Transformación afín al tamaño del modelo (512x384) usando centro y escala calculados del recorte
+3. **Normalización**: Transformación afín al tamaño del modelo (512x384 píxeles, width x height) usando centro y escala calculados del recorte
 4. **Predicción**: Keypoint-Detection Transformer procesa cada recorte
 5. **Flip-Test**: Promedio de predicciones con imagen espejo para mayor robustez
 6. **Transformación Inversa**: Coordenadas se mapean de vuelta al espacio original:
    - Espacio del modelo → Espacio del recorte (transformación afín inversa)
    - Espacio del recorte → Imagen original (aplicación de offsets de bounding box)
-
-## Resultados (COCO val2017 con DETR bbox) con el modelo seleccionado
-
-| Backbone   | Input Size | AP | AP .50 | AP .75 | AP (M) | AP (L) | AR | AR .5 | AR .75 | AR (M) | AR (L) |
-| -------------- | -------------- | ------ | --------- | --------- | -------- | -------- | ------ | --------- | --------- | -------- | -------- |
-| prtr_hrnet_w32  | 512x384      | 73.3   | 89.2      | 79.9      | 69.0     | 80.9     | 80.2   | 93.6      | 85.7      | 75.5     | 86.8     |
 
 ## Pasos para ejecutar el proyecto
 
@@ -104,6 +111,7 @@ models/
     ├── model.safetensors
     └── preprocessor_config.json
 ```
+Descargar en el siguinte link [link models](https://drive.google.com/drive/folders/1eJCNwf9BnJf0YoOLLk5rKQw7pdFtb33w?usp=sharing)
 
 #### Ejecución por Lotes
 
@@ -205,9 +213,11 @@ La función `load_models()` en `app.py`:
    - Umbral de confianza configurable (0.9 recomendado)
 
 2. **NMS (Non-Maximum Suppression)**:
-   - Eliminación de detecciones duplicadas
+   - **Nota importante**: Aunque DETR usa matching bipartito, puede generar detecciones duplicadas de la misma persona
+   - Se aplica NMS para eliminar estas detecciones duplicadas
    - Cálculo de IoU (Intersection over Union) entre cajas
    - Umbral IoU configurable (0.5 recomendado)
+   - Esto asegura que cada persona sea detectada solo una vez
 
 3. **Expansión de Bounding Boxes**:
    - Cada caja se expande 25% en cada dirección (50% total)
@@ -219,7 +229,7 @@ La función `load_models()` en `app.py`:
 1. **Transformación Afín**:
    - **Centro**: `(w/2, h/2)` del recorte
    - **Escala**: `max(w, h) / 200.0 * 1.25` (factor 1.25 para margen)
-   - **Tamaño objetivo**: 512x384 píxeles
+   - **Tamaño objetivo**: 512x384 píxeles (width x height)
 
 2. **Inferencia del Modelo**:
    - **Forward pass original**: Recorte transformado → predicción
@@ -228,14 +238,17 @@ La función `load_models()` en `app.py`:
    - Mayor robustez ante variaciones de orientación
 
 3. **Hungarian Matching**:
+   - Se ejecuta internamente en `get_final_preds_match()` usando `linear_sum_assignment`
    - 100 queries aprendidas compiten para predecir 17 keypoints
-   - Asignación óptima basada en:
+   - Asignación óptima basada en las probabilidades de clase (matriz de costos negativa)
+   - El algoritmo encuentra la mejor asignación 1-a-1 entre queries y keypoints
+
+4. **Filtrado Posterior**:
+   - Después del Hungarian Matching, se aplican filtros adicionales para validar keypoints:
      - **Probabilidad de clase** > 30%
      - **Distancia espacial** < 50 píxeles
      - **Confianza del heatmap** > 80%
    - Si no se cumplen condiciones estrictas, se buscan queries de soporte cercanas
-
-4. **Filtrado Robusto**:
    - Keypoints con confianza > 0.8 se aceptan
    - Keypoints con baja confianza se enmascaran como NaN
 
@@ -267,13 +280,34 @@ La función `load_models()` en `app.py`:
 - **Expansión bbox**: 25% (mejor contexto para keypoints)
 
 #### Parámetros PRTR
-- **Tamaño entrada**: 512x384 (óptimo para HRNet-W32)
+- **Tamaño entrada**: 512x384 píxeles (width x height, óptimo para HRNet-W32)
 - **Flip-test**: Habilitado (mejora robustez)
 - **Umbral keypoints**: 0.8 (filtrado conservador)
+- **Hungarian Matching**: Automático (basado en probabilidades de clase)
+- **Filtrado posterior**: Probabilidad > 30%, distancia < 50px, confianza > 80%
 
-## Acknowledgments
-This project is based on the following open source repositories, which greatly facilitate our research.
+## Agradecimientos
+Este proyecto está basado en los siguientes repositorios de código abierto, que facilitan enormemente nuestra investigación.
 
-- Thanks to [DETR](https://github.com/facebookresearch/detr) for the implementation of [Detection Transformer](https://arxiv.org/abs/2005.12872)
+- Gracias a [DETR](https://github.com/facebookresearch/detr) por la implementación de [Detection Transformer](https://arxiv.org/abs/2005.12872)
 
-- Thanks to [PRTR](https://github.com/mlpc-ucsd/PRTR/tree/main) for the implementation of [Pose Recognition with Cascade Transformers](https://openaccess.thecvf.com/content/CVPR2021/papers/Li_Pose_Recognition_With_Cascade_Transformers_CVPR_2021_paper.pdf)
+- Gracias a [PRTR](https://github.com/mlpc-ucsd/PRTR/tree/main) por la implementación de [Pose Recognition with Cascade Transformers](https://openaccess.thecvf.com/content/CVPR2021/papers/Li_Pose_Recognition_With_Cascade_Transformers_CVPR_2021_paper.pdf)
+
+
+## Herramientas Utilizadas
+
+- 🧰 **[Git](https://git-scm.com/)**
+- 🗂 **[GitHub](https://github.com/)**
+- 🐍 **[Python](https://www.python.org/)**
+- 🔥 **[Pytorch](https://pytorch.org/)**
+- 🐳 **[Docker](https://www.docker.com/)**
+- 📈 **[Streamlit](https://streamlit.io/)**
+- 🧬 **[Hugging Face Transformers](https://huggingface.co/docs/transformers)**
+
+
+
+## Autores
+
+- **Jhonatan Steven Morales / jhonatan19991**  
+- **Manuel Alejandro Perlaza / manuel-gruezo**  
+- **Carol Dayana Varela / caroldvarela**  
