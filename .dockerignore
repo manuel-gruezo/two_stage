@@ -1,0 +1,51 @@
+# Ignorar archivos innecesarios en el contexto de Docker
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Archivos de IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Archivos temporales
+*.tmp
+*.temp
+
+# Documentación (excepto README)
+*.md
+!DOCKER_README.md
+
+# Archivos de configuración local
+.env
+.env.local
+
+# Output (se monta como volumen)
+output/
+
+# Modelos grandes (se descargan en el contenedor)
+models/pytorch/pose_coco/*.pth

@@ -1,0 +1,29 @@
+services:
+  pose-prediction:
+    build: .
+    container_name: prtr-pose-prediction
+    ports:
+      - "8501:8501"  # Puerto para Streamlit
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+      - ./models:/app/models
+      - ./.streamlit:/app/.streamlit
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+    # Usar GPU si está disponible
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Comando por defecto - iniciar aplicación Streamlit
+    command: ["python", "start_app.py"]
+    # Comando alternativo para probar el modelo
+    # command: ["python", "test_model.py"]
+    # Mantener el contenedor corriendo para debugging
+    stdin_open: true
+    tty: true
