@@ -1,33 +1,23 @@
 import streamlit as st
 import numpy as np
-from pathlib import Path
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageDraw
 import torch
 import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
 import sys
 import os
 import io
-import base64
 import cv2
 import time
+import tempfile
+import hashlib
 from transformers import DetrImageProcessor, DetrForObjectDetection
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 
-"""
-CONFIGURACIÓN DE MODELOS:
-
-• Pose Transformer: HRNet-W32, entrada 512x384, entrenado en COCO
-• DETR: ResNet-101, detector de objetos general (usado para detectar personas)
-• Dispositivo: Usa GPU si está disponible, sino CPU
-
-NOTA: Los modelos se cargan una vez y se cachean (@st.cache_resource) para mejor rendimiento.
-Esto evita recargarlos en cada interacción del usuario, mejorando significativamente la velocidad.
-"""
 
 # Configurar la página
 st.set_page_config(
     page_title="Pose Estimation App",
-    page_icon="🤸",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -175,13 +165,8 @@ st.markdown("""
 # Añadir el directorio lib al path para imports
 sys.path.insert(0, '/app/lib')
 
-# Instalar soporte para AVIF si está disponible
-try:
-    import pillow_avif
-    st.success(" Soporte AVIF disponible")
-except ImportError:
-    st.warning(" Soporte AVIF no disponible - las imágenes AVIF no se podrán procesar")
 
+import pillow_avif
 # Imports del proyecto
 from config import cfg as conf
 from config import update_config
@@ -213,28 +198,25 @@ def load_models():
     
     Nota: Si hay error, se muestra un mensaje de error en Streamlit y se retorna None para cada componente.
     """
-    try:
-        args = Args()
-        update_config(conf, args)
-        
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Cargar modelo de pose
-        pose_model = models.pose_transformer.get_pose_net(conf, is_train=False)
-        state = torch.load(args.pretrained, map_location='cpu')
-        pose_model.load_state_dict(model_key_helper(state), strict=False)
-        pose_model.to(device)
-        pose_model.eval()
-        
-        # Cargar modelo DETR
-        local_model_path = "models/detr-resnet-101"
-        detr_processor = DetrImageProcessor.from_pretrained(local_model_path)
-        detr_model = DetrForObjectDetection.from_pretrained(local_model_path)
-        
-        return pose_model, detr_model, detr_processor, device, conf
-    except Exception as e:
-        st.error(f"Error cargando los modelos: {e}")
-        return None, None, None, None, None
+
+    args = Args()
+    update_config(conf, args)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Cargar modelo de pose
+    pose_model = models.pose_transformer.get_pose_net(conf, is_train=False)
+    state = torch.load(args.pretrained, map_location='cpu')
+    pose_model.load_state_dict(model_key_helper(state), strict=False)
+    pose_model.to(device)
+    pose_model.eval()
+    
+    # Cargar modelo DETR
+    local_model_path = "models/detr-resnet-101"
+    detr_processor = DetrImageProcessor.from_pretrained(local_model_path)
+    detr_model = DetrForObjectDetection.from_pretrained(local_model_path)
+    
+    return pose_model, detr_model, detr_processor, device, conf
 
 # ---------- Normalización ----------
 normalize = transforms.Compose([
@@ -243,15 +225,14 @@ normalize = transforms.Compose([
                          std=[0.229, 0.224, 0.225]),
 ])
 
-# Variables globales para el modelo de pose
-model_w, model_h = 512, 384  # Tamaño por defecto del modelo
+# Tamaño del modelo de pose (se usa en get_pose_keypoints)
+MODEL_W, MODEL_H = 384, 512
 
 # ---------- Esqueleto para dibujar - COCO ----------
-# Skeleton EXACTO de la clase Visualizer (1-based)
-SKELETON_1BASED = [[16, 14], [14, 12], [17, 15], [15, 13], [12, 13], [6, 12], [7, 13],
-                   [6, 7], [6, 8], [7, 9], [8, 10], [9, 11], [2, 3], [1, 2], [1, 3],
-                   [2, 4], [3, 5], [4, 6], [5, 7]]
-SKELETON = [[a-1, b-1] for a, b in SKELETON_1BASED]  # Convertir a 0-based
+# Skeleton en formato 0-based (índices de array Python)
+SKELETON = [[15, 13], [13, 11], [16, 14], [14, 12], [11, 12], [5, 11], [6, 12],
+            [5, 6], [5, 7], [6, 8], [7, 9], [8, 10], [1, 2], [0, 1], [0, 2],
+            [1, 3], [2, 4], [3, 5], [4, 6]]
 
 # ---------- Funciones auxiliares para metadatos y preprocesamiento ----------
 def make_meta_from_wh(w, h, use_max_scale=True):
@@ -302,21 +283,16 @@ def preprocess_patch(img_pil, center, scale, output_size):
 
 # ---------- Dibujo de keypoints y esqueleto ----------
 """
-DISEÑO VISUAL - Basado en Visualizer original:
+DISEÑO VISUAL:
 
-• Esqueleto: Líneas gruesas coloridas por segmento corporal
-  - Verde: brazo izquierdo (hombro → codo → muñeca)
-  - Amarillo: brazo derecho (hombro → codo → muñeca)
-  - Azul: pierna izquierda (hombro → cadera → rodilla → tobillo)
-  - Rosa: pierna derecha (hombro → cadera → rodilla → tobillo)
-  - Rosa claro: conexiones de cabeza (líneas delgadas)
-  
-• Keypoints: Círculos negros con tamaño proporcional
-  - Cabeza: círculos más pequeños (1.5x escala)
-  - Cuerpo: círculos más grandes (3.0x escala)
-  
-• Visibilidad: Basada en confianza > 80% (configurable)
-• Escala: Ajusta automáticamente al tamaño de la imagen
+Esqueleto con líneas coloridas por segmento corporal:
+   Verde: brazo izquierdo (hombro → codo → muñeca)
+   Amarillo: brazo derecho (hombro → codo → muñeca)
+   Azul: pierna izquierda (cadera → rodilla → tobillo)
+   Rosa: pierna derecha (cadera → rodilla → tobillo)
+   Rosa claro: conexiones de cabeza (líneas delgadas)
+   
+Visualización con círculos negros para los puntos clave
 """
 def draw_keypoints_pil(img_pil, keypoints, confidences=None, scale=1.0, 
                       point_size_multiplier=1.0, line_width_multiplier=1.0):
@@ -334,8 +310,9 @@ def draw_keypoints_pil(img_pil, keypoints, confidences=None, scale=1.0,
     Returns:
         PIL.Image: Imagen modificada con keypoints y esqueleto dibujados
     
-    Nota: Solo dibuja keypoints con confianza > 80%. Los keypoints con coordenadas NaN
-    o confianza baja no se visualizan.
+    Nota: Los keypoints ya fueron filtrados en get_pose_keypoints (conf_th = 0.8).
+    Solo se dibujan los keypoints con score > 0 (los filtrados tienen score = 0.0).
+    Los keypoints con coordenadas NaN no se visualizan.
     """
     draw = ImageDraw.Draw(img_pil)
     
@@ -346,21 +323,22 @@ def draw_keypoints_pil(img_pil, keypoints, confidences=None, scale=1.0,
     PINK = [(6,12),(12,14),(14,16)]       # right_shoulder->right_hip->right_knee->right_ankle
     
     # Convertir confidences a vis mask
+    # Los keypoints ya fueron filtrados en get_pose_keypoints (score > 0.8)
+    # Los filtrados tienen score = 0.0, así que solo verificamos score > 0
     vis = np.ones((17,), dtype=np.int32)  # Por defecto todos visibles
     if confidences is not None:
         confidences = np.asarray(confidences)
-        vis = (confidences > 0.8).astype(np.int32)
+        vis = (confidences > 0.0).astype(np.int32)  # Solo verificar que no sea 0 (ya filtrado)
     
-    # Dibujar líneas del skeleton EXACTAMENTE como Visualizer
-    for i, j in SKELETON_1BASED:  # Usar 1-based
-        i_idx, j_idx = i - 1, j - 1  # Convertir a 0-based para índices
+    # Dibujar líneas del skeleton
+    for i_idx, j_idx in SKELETON:  # Ya son 0-based
         if vis[i_idx] <= 0 or vis[j_idx] <= 0:
             continue
         
         src = keypoints[i_idx]
         dst = keypoints[j_idx]
         
-        # Calcular ki, kj como en Visualizer
+        # Calcular ki, kj para determinar colores
         ki = min(i_idx, j_idx)
         kj = max(i_idx, j_idx)
         
@@ -407,33 +385,6 @@ def draw_keypoints_pil(img_pil, keypoints, confidences=None, scale=1.0,
     
     return img_pil
 
-def draw_keypoints_on_cv2(img_cv2, keypoints, radius=3, line_width=2):
-    """Dibujar keypoints en imagen OpenCV"""
-    img_copy = img_cv2.copy()
-    for a,b in SKELETON:
-        a_idx, b_idx = a, b  # Ya son 0-indexed
-        if np.any(np.isnan(keypoints[a_idx])) or np.any(np.isnan(keypoints[b_idx])):
-            continue
-        pt1 = (int(keypoints[a_idx][0]), int(keypoints[a_idx][1]))
-        pt2 = (int(keypoints[b_idx][0]), int(keypoints[b_idx][1]))
-        cv2.line(img_copy, pt1, pt2, (0, 255, 0), line_width)
-    
-    for (x,y) in keypoints:
-        if np.isnan(x) or np.isnan(y):
-            continue
-        center = (int(x), int(y))
-        cv2.circle(img_copy, center, radius, (255, 0, 0), -1)
-    
-    return img_copy
-
-def cv2_to_pil(cv2_img):
-    """Convertir imagen OpenCV a PIL"""
-    rgb_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb_img)
-
-def pil_to_cv2(pil_img):
-    """Convertir imagen PIL a OpenCV"""
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 def get_pose_keypoints(person_crop_pil, bbox_expanded, pose_model, device, conf):
     """
@@ -463,25 +414,13 @@ def get_pose_keypoints(person_crop_pil, bbox_expanded, pose_model, device, conf)
             plot_scale (float): Factor recomendado para escalar elementos de dibujo
     """
     # Obtener tamaño del modelo
-    try:
-        img_size = conf.MODEL.IMAGE_SIZE
-        model_w, model_h = int(img_size[0]), int(img_size[1])
-    except Exception:
-        model_w, model_h = 512, 384
+    model_w, model_h = MODEL_W, MODEL_H
     # Obtener dimensiones del recorte
     crop_w, crop_h = person_crop_pil.size
     x_min_expanded, y_min_expanded, x_max_expanded, y_max_expanded = bbox_expanded
     
     # Crear metadatos de centro y escala a partir del tamaño del recorte
     center, scale = make_meta_from_wh(crop_w, crop_h, use_max_scale=True)
-    
-    meta = {
-        'center': center,
-        'scale': scale,
-        'rotation': 0,
-        'joints_3d': np.zeros((17, 3), dtype=np.float32),
-        'joints_3d_vis': np.ones((17, 3), dtype=np.float32)
-    }
     
     # Preprocesar con transformación afín al tamaño esperado por el modelo
     input_patch = preprocess_patch(person_crop_pil, center, scale, (model_w, model_h))
@@ -492,7 +431,7 @@ def get_pose_keypoints(person_crop_pil, bbox_expanded, pose_model, device, conf)
         outputs = pose_model(input_tensor)
     
     # Forward pass flipped
-    input_flipped = np.flip(input_patch, axis=1).copy()
+    input_flipped = np.flip(input_patch, axis=1)
     input_flipped_tensor = normalize(Image.fromarray(input_flipped)).unsqueeze(0).to(device)
     with torch.no_grad():
         outputs_flipped = pose_model(input_flipped_tensor)
@@ -515,63 +454,58 @@ def get_pose_keypoints(person_crop_pil, bbox_expanded, pose_model, device, conf)
     preds_final = np.asarray(preds_raw[0])  # (17, 2) - coordenadas del recorte
     heat_conf = np.asarray(maxvals[0, :, 0])  # (17,)
     
-    # DEBUG: Verificar pipeline de transformación
-    print(f"TRANSFORMACIÓN - Recorte: {crop_w}x{crop_h}, Bbox: {bbox_expanded}")
-    print(f"TRANSFORMACIÓN - Centro: {center}, Escala: {scale}")
-    
     # Aplicar filtrado
     conf_th = 0.8
     valid_mask = np.zeros((17,), dtype=np.int32)
+
+    logits = outputs['pred_logits']
+    pred_coords_q = outputs['pred_coords']
+    logits_f = outputs_flipped['pred_logits']
+    pred_coords_q_f = outputs_flipped['pred_coords']
+
+    probs = torch.softmax((logits + logits_f) / 2.0, dim=-1)[0].cpu().numpy()
+    coords_q = ((pred_coords_q + pred_coords_q_f) / 2.0)[0].cpu().numpy()
+    coords_q *= np.array([model_w, model_h])
     
-    if isinstance(outputs, dict) and 'pred_logits' in outputs and 'pred_coords' in outputs:
-        logits = outputs['pred_logits']
-        pred_coords_q = outputs['pred_coords']
-        
-        logits_f = outputs_flipped['pred_logits']
-        pred_coords_q_f = outputs_flipped['pred_coords']
-        
-        probs = torch.softmax((logits + logits_f) / 2.0, dim=-1)[0].cpu().numpy()
-        coords_q = ((pred_coords_q + pred_coords_q_f) / 2.0)[0].cpu().numpy()
-        
-        if coords_q.max() <= 1.01:
-            coords_q[:, 0] *= model_w
-            coords_q[:, 1] *= model_h
-        
-        # HUNGARIAN MATCHING - Alineación queries↔keypoints
-        # El modelo PRTR usa 100 queries, pero solo necesitamos 17 keypoints
-        # Buscamos la mejor query para cada keypoint basado en:
-        # 1. Probabilidad de clase > 30% (ACCEPT_PROB_TH)
-        # 2. Distancia espacial < 50 píxeles (ACCEPT_DIST_TH)
-        # 3. Confianza del heatmap > 80% (conf_th)
-        # Si no se cumple pero hay queries de soporte cercanas, se acepta igualmente
-        for j in range(17):
-            class_probs = probs[:, j]
-            best_query_idx = np.argmax(class_probs)
+
+    ACCEPT_PROB_TH = 0.3
+    ACCEPT_DIST_TH = 50.0
+
+    best_probs = []
+    for j in range(17):
+
+        class_probs = probs[:, j]
+        bg_probs = probs[:, 17]  # fondo
+
+        # Costo de matching basado en probabilidad (entre más alta la probabilidad, menor el costo)
+        cost = -class_probs
+
+        # Ignorar queries donde la probabilidad del fondo sea mayor que la del keypoint
+        valid_queries = np.where((class_probs > bg_probs) & (bg_probs > 0.8))[0]
+        if len(valid_queries) == 0:
+            # Si todos los queries creen que es fondo, elegimos el de menor costo global
+            best_query_idx = np.argmin(cost)
             best_prob = class_probs[best_query_idx]
-            query_coord = coords_q[best_query_idx]
-            joint_coord = preds_final[j]
-            distance = np.linalg.norm(query_coord - joint_coord)
-            
-            ACCEPT_PROB_TH = 0.3
-            ACCEPT_DIST_TH = 50.0
-            
-            accepted = (best_prob > ACCEPT_PROB_TH and 
-                       distance < ACCEPT_DIST_TH and 
-                       heat_conf[j] > conf_th)
-            
-            # Si no se cumplen las condiciones estrictas pero hay queries de soporte,
-            # aceptamos el keypoint (heurística para casos ambiguos)
-            if not accepted and heat_conf[j] > conf_th:
-                supporting_queries = np.where((class_probs > 0.1) & 
-                                            (np.linalg.norm(coords_q - joint_coord, axis=1) < 80.0))[0]
-                if len(supporting_queries) > 0:
-                    accepted = True
-            
-            valid_mask[j] = 1 if accepted else 0
-    else:
-        valid_mask = (heat_conf > conf_th).astype(np.int32)
+            best_probs.append(best_prob)
+        else:
+            # Entre los válidos, seleccionamos el de menor costo (mayor probabilidad)
+            best_query_idx = valid_queries[np.argmin(cost[valid_queries])]
+            best_prob = class_probs[best_query_idx]
+
+        # Coordenadas
+        query_coord = coords_q[best_query_idx]
+        joint_coord = preds_final[j]
+        distance = np.linalg.norm(query_coord - joint_coord)
+
+        # Criterios de aceptación
+        accepted = (
+            best_prob > ACCEPT_PROB_TH and
+            distance < ACCEPT_DIST_TH and
+            heat_conf[j] > conf_th
+        )
+        valid_mask[j] = 1 if accepted else 0
     
-    # Filtrar keypoints
+    # Filtrar keypoints (necesitamos copia porque preds_final se usa en el loop anterior)
     filtered_preds = preds_final.copy()
     filtered_scores = heat_conf.copy()
     
@@ -579,21 +513,12 @@ def get_pose_keypoints(person_crop_pil, bbox_expanded, pose_model, device, conf)
         if valid_mask[i] == 0:
             filtered_preds[i] = [np.nan, np.nan]
             filtered_scores[i] = 0.0
-    
-    # CORRECCIÓN CRÍTICA: Transformar coordenadas del espacio del modelo al espacio del recorte
-    # y luego al espacio de la imagen original
-    
-    # Las coordenadas de get_final_preds_match están en el espacio del recorte transformado
-    # Necesitamos mapearlas al espacio del recorte original primero
-    
-    # 1. Crear transformación inversa para mapear del espacio del modelo al espacio del recorte original
+
     trans_inv = get_affine_transform(center, scale, 0, (model_w, model_h), inv=1)
     
-    # 2. Transformar cada keypoint al espacio del recorte original
     keypoints_crop_space = []
     for kp in filtered_preds:
         if not np.isnan(kp[0]):
-            # Aplicar transformación inversa
             kp_homogeneous = np.array([kp[0], kp[1], 1.0])
             kp_original = trans_inv.dot(kp_homogeneous)
             keypoints_crop_space.append([kp_original[0], kp_original[1]])
@@ -602,94 +527,27 @@ def get_pose_keypoints(person_crop_pil, bbox_expanded, pose_model, device, conf)
     
     keypoints_crop_space = np.array(keypoints_crop_space)
     
-    # 3. Transformar del espacio del recorte al espacio de la imagen original
+    # Transformar del espacio del recorte al espacio de la imagen original
     keypoints_original = keypoints_crop_space.copy()
     keypoints_original[:, 0] += x_min_expanded
     keypoints_original[:, 1] += y_min_expanded
-    
-    # DEBUG: Verificar pipeline de transformación
-    print(f"TRANSFORMACIÓN - Keypoint 0: modelo[{filtered_preds[0]}] → recorte[{keypoints_crop_space[0]}] → original[{keypoints_original[0]}]")
     
     # Calcular plot_scale
     plot_scale = np.linalg.norm(scale) / 2.0
     
     return keypoints_original, filtered_scores.reshape(-1, 1), plot_scale
 
-def apply_nms_to_persons(persons, nms_threshold=0.5):
-    """
-    Aplicar Non-Maximum Suppression a las detecciones de personas para eliminar duplicados
-    """
-    if len(persons) <= 1:
-        return persons
-    
-    # Convertir a formato numpy para cálculos
-    scores = np.array([score.item() for score, _ in persons])
-    boxes = np.array([[box[0].item(), box[1].item(), box[2].item(), box[3].item()] for _, box in persons])
-    
-    # Ordenar por score descendente
-    indices = np.argsort(scores)[::-1]
-    
-    keep = []
-    while len(indices) > 0:
-        # Tomar el box con mayor score
-        current = indices[0]
-        keep.append(current)
-        
-        if len(indices) == 1:
-            break
-            
-        # Calcular IoU con el resto de boxes
-        current_box = boxes[current]
-        other_boxes = boxes[indices[1:]]
-        
-        # Calcular IoU
-        ious = calculate_iou(current_box, other_boxes)
-        
-        # Mantener solo boxes con IoU menor al threshold
-        indices = indices[1:][ious < nms_threshold]
-    
-    # Retornar solo las personas seleccionadas
-    return [persons[i] for i in keep]
-
-def calculate_iou(box1, boxes2):
-    """
-    Calcular Intersection over Union (IoU) entre un box y múltiples boxes
-    """
-    # box1: [x1, y1, x2, y2]
-    # boxes2: [[x1, y1, x2, y2], ...]
-    
-    # Coordenadas de intersección
-    x1 = np.maximum(box1[0], boxes2[:, 0])
-    y1 = np.maximum(box1[1], boxes2[:, 1])
-    x2 = np.minimum(box1[2], boxes2[:, 2])
-    y2 = np.minimum(box1[3], boxes2[:, 3])
-    
-    # Calcular área de intersección
-    intersection = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
-    
-    # Calcular área de cada box
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    
-    # Calcular área de unión
-    union = area1 + area2 - intersection
-    
-    # Calcular IoU
-    iou = intersection / union
-    
-    return iou
 
 def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, device, conf, 
                            point_size_multiplier=1.0, line_width_multiplier=1.0,
-                           detr_threshold=0.9, nms_threshold=0.5):
+                           detr_threshold=0.9):
     """
     Inferencia multi-persona usando DETR para detectar personas y luego keypoints.
 
     FLUJO MULTI-PERSONA:
-    1. DETR detecta todas las personas en la imagen
-    2. Aplicamos NMS para eliminar cajas duplicadas (DETR tiende a duplicar detecciones)
-    3. Para cada persona única:
-       - Expandimos la bbox 25% en cada dirección (da contexto extra para keypoints en bordes)
+    1. DETR detecta todas las personas en la imagen (usa matching bipartito, no requiere NMS)
+    2. Para cada persona detectada:
+       - Expandimos la bbox para dar contexto extra para keypoints en bordes
        - Recortamos y preprocesamos la región
        - Ejecutamos el modelo de pose
        - Transformamos coordenadas al espacio original
@@ -705,7 +563,6 @@ def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, d
         point_size_multiplier (float): Multiplicador para tamaño de puntos visualizados
         line_width_multiplier (float): Multiplicador para grosor de líneas del esqueleto
         detr_threshold (float): Umbral de confianza para detección DETR (0.9 recomendado)
-        nms_threshold (float): Umbral IoU para NMS (0.5 recomendado)
 
     Returns:
         tuple: (image_with_keypoints, person_count, persons_details) donde:
@@ -719,38 +576,31 @@ def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, d
         outputs = detr_model(**inputs)
         
         target_sizes = torch.tensor([image_pil.size[::-1]])
-        # Usar threshold configurable para ser más selectivo y evitar duplicados
+        # DETR usa matching bipartito, no requiere NMS. El threshold filtra por confianza
         results = detr_processor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=detr_threshold)[0]
         
         # Filtrar solo detecciones de personas (label == 1 en COCO dataset)
-        person_count = 0
-        
-        # Primero, obtener todas las personas detectadas
+        # Ordenar por score descendente para priorizar detecciones más confiables
         persons = []
         for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
             # En COCO dataset, label 1 es "person"
             if label.item() == 1:  # Solo personas
                 persons.append((score, box))
         
-        # Aplicar Non-Maximum Suppression (NMS) para eliminar detecciones duplicadas
-        original_count = len(persons)
-        if len(persons) > 1:
-            persons = apply_nms_to_persons(persons, nms_threshold=nms_threshold)
-            filtered_count = len(persons)
-            if original_count != filtered_count:
-                st.info(f"NMS aplicado: {original_count} -> {filtered_count} personas (eliminadas {original_count - filtered_count} duplicados)")
+        # Ordenar por score descendente (DETR ya maneja duplicados con matching bipartito)
+        persons.sort(key=lambda x: x[0].item(), reverse=True)
         
         # Crear una copia de la imagen original donde dibujaremos todos los keypoints
-        # Crear imagen para dibujar keypoints
         image_with_keypoints = image_pil.copy()
         
         # Procesar cada persona detectada
+        person_count = 0
         persons_details = []
         for idx, (score, box) in enumerate(persons, 1):
             person_count += 1
             
             # Convertir coordenadas: [x_min, y_min, x_max, y_max]
-            box = [round(i, 2) for i in box.tolist()]
+            box = box.tolist()
             
             x_min, y_min, x_max, y_max = box
             width = x_max - x_min
@@ -759,7 +609,7 @@ def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, d
             # Expandir la caja 50% (25% en cada lado)
             # La expansión de bbox ayuda con keypoints en bordes: dar contexto extra alrededor
             # de la persona mejora la detección de keypoints cerca de los bordes del recorte.
-            EXPANSION_FACTOR = 0.25  # 25% en cada dirección = 50% total
+            EXPANSION_FACTOR = 0.125  # 12.5% en cada dirección = 25% total
             expand_x = width * EXPANSION_FACTOR
             expand_y = height * EXPANSION_FACTOR
             
@@ -780,10 +630,12 @@ def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, d
                     pose_model, device, conf
                 )
 
-                # Dibujar keypoints sobre la imagen original usando la nueva función
-                # Usar plot_scale directamente como en test3.py con parámetros configurables
+                # Aplanar scores una sola vez para reutilizar
+                keypoint_scores_flat = keypoint_scores_crop.flatten()
+
+                # Dibujar keypoints sobre la imagen original
                 image_with_keypoints = draw_keypoints_pil(image_with_keypoints, keypoints_absolute, 
-                                                        confidences=keypoint_scores_crop.flatten(), 
+                                                        confidences=keypoint_scores_flat, 
                                                         scale=plot_scale,
                                                         point_size_multiplier=point_size_multiplier,
                                                         line_width_multiplier=line_width_multiplier)
@@ -792,7 +644,7 @@ def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, d
                 persons_details.append({
                     'bbox': [x_min_expanded, y_min_expanded, x_max_expanded, y_max_expanded],
                     'keypoints': keypoints_absolute.tolist(),
-                    'confidences': keypoint_scores_crop.flatten().tolist()
+                    'confidences': keypoint_scores_flat.tolist()
                 })
                 
             except Exception as e:
@@ -802,187 +654,459 @@ def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, d
         
     except Exception as e:
         st.error(f"Error en inferencia multi-persona: {e}")
-        return None, 0
+        return None, 0, []
 
-def infer_on_image_full(image_pil, model, device, conf, do_flip=True):
+def process_single_frame(frame_data, pose_model, detr_model, detr_processor, device, conf,
+                        point_size_multiplier, line_width_multiplier, detr_threshold,
+                        width, height):
     """
-    image_pil: PIL RGB original
-    devuelve coords (K,2) en coordenadas de la imagen original
+    Procesa un solo frame. Función auxiliar para procesamiento en paralelo.
+    
+    Args:
+        frame_data: tuple (frame_idx, frame_pil, frame_bgr)
+        pose_model: Modelo de pose
+        detr_model: Modelo DETR
+        detr_processor: Procesador DETR
+        device: Dispositivo de cómputo
+        conf: Configuración del modelo
+        point_size_multiplier: Multiplicador para tamaño de puntos
+        line_width_multiplier: Multiplicador para grosor de líneas
+        detr_threshold: Umbral de confianza DETR
+        width: Ancho del frame
+        height: Alto del frame
+    
+    Returns:
+        tuple: (frame_idx, result_bgr) o (frame_idx, None) si hay error
     """
+    frame_idx, frame_pil, frame_bgr = frame_data
     try:
-        # Obtener tamaño del modelo
-        try:
-            img_size = conf.MODEL.IMAGE_SIZE
-            model_w, model_h = int(img_size[0]), int(img_size[1])
-        except Exception:
-            # fallback: según tu mensaje previo el modelo espera 288 x 384 (w x h)
-            model_w, model_h = 384, 384
+        # Aplicar inferencia de pose
+        result_image, person_count, _ = infer_multi_person_pose(
+            frame_pil, pose_model, detr_model, detr_processor, device, conf,
+            point_size_multiplier, line_width_multiplier, detr_threshold
+        )
         
-        # resize al tamaño del modelo (PIL: (width, height))
-        resized = image_pil.resize((model_w, model_h), Image.BILINEAR)
-
-        # centro y scale en coordenadas originales (convención usada en muchos demos HRNet)
-        orig_w, orig_h = image_pil.size
-        c = np.array([orig_w * 0.5, orig_h * 0.5], dtype=np.float32)
-        scale_val = max(orig_w, orig_h) / 200.0
-        s = np.array([scale_val, scale_val], dtype=np.float32)
-
-        # forward original (tensors en device)
-        x = normalize(resized).unsqueeze(0).to(device)
-        with torch.no_grad():
-            out = model(x)
-
-        # pasar salida al postprocess tal cual
-        _, _, preds_raw = get_final_preds_match(conf, out, c, s)
-
-        # preds_raw puede venir en distinto sistema de coordenadas.
-        preds = preds_raw[0].copy()  # (K,2)
-
-        # si las coordenadas están en el espacio del "resized" (es decir muy pequeñas y < model_w/model_h),
-        # entonces las escalamos a la imagen original (interpolación lineal).
-        # heurística: si la mayoría de puntos caben dentro de [0, model_w] x [0, model_h],
-        # consideramos que están en coords de la imagen redimensionada.
-        inside_resized = np.sum((preds[:, 0] >= 0) & (preds[:, 0] <= model_w) &
-                                (preds[:, 1] >= 0) & (preds[:, 1] <= model_h))
-        if inside_resized >= 0.5 * preds.shape[0]:
-            scale_x = orig_w / float(model_w)
-            scale_y = orig_h / float(model_h)
-            preds[:, 0] = preds[:, 0] * scale_x
-            preds[:, 1] = preds[:, 1] * scale_y
-            return preds
-
-        # si no estaban en coords de resized, asumimos que ya vienen mapeadas (por ejemplo get_final_preds_match ya devolvió coords originales)
-        if do_flip:
-            # predicción espejo y promedio (si hace falta)
-            resized_flip = ImageOps.mirror(resized)
-            x_f = normalize(resized_flip).unsqueeze(0).to(device)
-            with torch.no_grad():
-                out_f = model(x_f)
-            _, _, preds_raw_f = get_final_preds_match(conf, out_f, c, s)
-            preds_f = preds_raw_f[0].copy()
-
-            # aplicar misma heurística al flip
-            inside_resized_f = np.sum((preds_f[:, 0] >= 0) & (preds_f[:, 0] <= model_w) &
-                                      (preds_f[:, 1] >= 0) & (preds_f[:, 1] <= model_h))
-            if inside_resized_f >= 0.5 * preds_f.shape[0]:
-                preds_f[:, 0] = preds_f[:, 0] * (orig_w / float(model_w))
-                preds_f[:, 1] = preds_f[:, 1] * (orig_h / float(model_h))
-
-            # promedio (ya ambas en coordenadas originales o ambas en resized escaladas)
-            preds = (preds + preds_f) / 2.0
-
-        return preds
+        if result_image is not None:
+            # Convertir PIL a OpenCV (ya viene del tamaño correcto porque el frame fue redimensionado antes)
+            result_np = np.array(result_image)
+            # Solo redimensionar si es absolutamente necesario (no debería ser necesario)
+            if result_np.shape[:2] != (height, width):
+                result_np = cv2.resize(result_np, (width, height), interpolation=cv2.INTER_LINEAR)
+            result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+            return (frame_idx, result_bgr)
+        else:
+            # Si falla, devolver frame original
+            return (frame_idx, frame_bgr)
+            
     except Exception as e:
-        st.error(f"Error en la inferencia: {e}")
-        return None
+        # Si hay error, devolver frame original
+        return (frame_idx, frame_bgr)
+
+def get_video_hash(video_bytes):
+    """Genera un hash del video para usar como clave de caché"""
+    return hashlib.md5(video_bytes).hexdigest()
+
+def resize_frame_if_needed(frame, target_width, target_height):
+    """
+    Redimensiona un frame al tamaño objetivo usando interpolación rápida.
+    Para velocidad, simplemente redimensiona sin mantener aspect ratio exacto.
+    
+    Args:
+        frame: Frame OpenCV (BGR)
+        target_width: Ancho objetivo
+        target_height: Alto objetivo
+    
+    Returns:
+        Frame redimensionado
+    """
+    h, w = frame.shape[:2]
+    if w == target_width and h == target_height:
+        return frame
+    
+    # Redimensionar directamente al tamaño objetivo (más rápido)
+    # Usar INTER_LINEAR para balance velocidad/calidad
+    resized = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+    return resized
+
+
+def process_video(video_file, pose_model, detr_model, detr_processor, device, conf,
+                 point_size_multiplier=1.0, line_width_multiplier=1.0,
+                 detr_threshold=0.9, max_frames=None, frame_skip=1,
+                 batch_size=8, target_resolution=None):
+    """
+    Procesa un video frame por frame aplicando detección de pose en streaming.
+    Procesa y escribe frames inmediatamente para reducir uso de memoria.
+    
+    Args:
+        video_file: Archivo de video subido (BytesIO o path)
+        pose_model: Modelo de pose
+        detr_model: Modelo DETR
+        detr_processor: Procesador DETR
+        device: Dispositivo de cómputo
+        conf: Configuración del modelo
+        point_size_multiplier: Multiplicador para tamaño de puntos
+        line_width_multiplier: Multiplicador para grosor de líneas
+        detr_threshold: Umbral de confianza DETR
+        max_frames: Número máximo de frames a procesar (None = todos)
+        frame_skip: Procesar cada N frames (1 = todos, 2 = cada 2, etc.)
+        batch_size: Número de frames a procesar en paralelo (default: 8, reducido para menor uso de memoria)
+        target_resolution: tuple (width, height) para redimensionar frames, o None para mantener original
+    
+    Returns:
+        tuple: (video_path, total_frames, processed_frames, fps, width, height)
+    """
+    tfile = None
+    output_path = None
+    cap = None
+    out = None
+    
+    try:
+        # Leer video completo para hash y guardar
+        video_bytes = video_file.read()
+        video_hash = get_video_hash(video_bytes)
+        
+        # Incluir resolución en el hash del caché
+        res_str = f"{target_resolution[0]}x{target_resolution[1]}" if target_resolution else "original"
+        cache_hash = hashlib.md5(f"{video_hash}_{res_str}_{batch_size}_{frame_skip}".encode()).hexdigest()
+        
+        # Verificar caché
+        cache_dir = tempfile.gettempdir()
+        cache_file = os.path.join(cache_dir, f"pose_video_cache_{cache_hash}.mp4")
+        
+        if os.path.exists(cache_file):
+            st.info(f"Video encontrado en caché. Usando versión procesada anteriormente.")
+            # Leer propiedades del video en caché
+            cap_cache = cv2.VideoCapture(cache_file)
+            if cap_cache.isOpened():
+                fps = int(cap_cache.get(cv2.CAP_PROP_FPS)) or 30
+                width = int(cap_cache.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap_cache.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                total_frames = int(cap_cache.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap_cache.release()
+                return cache_file, total_frames, total_frames, fps, width, height
+        
+        # Guardar video temporalmente
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(video_bytes)
+        tfile.close()
+        
+        # Abrir video
+        cap = cv2.VideoCapture(tfile.name)
+        if not cap.isOpened():
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            return None, 0, 0, 0, 0, 0
+        
+        # Obtener propiedades del video original
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+        orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if orig_width == 0 or orig_height == 0:
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            return None, 0, 0, 0, 0, 0
+        
+        # Aplicar resolución objetivo si se especifica
+        if target_resolution:
+            width, height = target_resolution
+            st.info(f"Redimensionando video de {orig_width}x{orig_height} a {width}x{height} para procesamiento más rápido")
+        else:
+            width, height = orig_width, orig_height
+        
+        # Crear video de salida (usar caché si existe)
+        output_path = cache_file
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        if not out.isOpened():
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            if output_path and os.path.exists(output_path):
+                os.unlink(output_path)
+            return None, 0, 0, 0, 0, 0
+        
+        # Procesar en streaming: leer, procesar en batches pequeños, escribir en orden
+        frame_count = 0
+        processed_count = 0
+        frames_to_write = {}  # Buffer ordenado para escribir frames en orden: {frame_idx: frame_bgr}
+        next_write_idx = 0  # Índice del siguiente frame a escribir
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Cola para frames a procesar (limitar tamaño para reducir memoria)
+        frame_queue = deque(maxlen=batch_size * 2)
+        
+        # Procesar frames en streaming
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Redimensionar frame si es necesario (ANTES de procesar para mayor velocidad)
+            if target_resolution:
+                frame = resize_frame_if_needed(frame, width, height)
+            
+            # Limitar número de frames si se especifica
+            if max_frames is not None and processed_count >= max_frames:
+                # Guardar frame sin procesar en buffer para escribir en orden
+                frames_to_write[frame_count] = frame
+                frame_count += 1
+                continue
+            
+            # Saltar frames según frame_skip
+            if frame_count % frame_skip != 0:
+                # Guardar frame sin procesar en buffer para escribir en orden
+                frames_to_write[frame_count] = frame
+                frame_count += 1
+                continue
+            
+            # Convertir frame a PIL Image (ya redimensionado)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb)
+            
+            # Agregar a cola para procesamiento
+            frame_queue.append((frame_count, frame_pil, frame))
+            
+            frame_count += 1
+            
+            # Procesar batch cuando la cola esté llena
+            if len(frame_queue) >= batch_size:
+                # Procesar batch actual
+                batch_frames = list(frame_queue)
+                frame_queue.clear()
+                
+                # Procesar frames en paralelo
+                batch_results = process_batch_frames(
+                    batch_frames, pose_model, detr_model, detr_processor, device, conf,
+                    point_size_multiplier, line_width_multiplier, detr_threshold,
+                    width, height, max_workers=min(batch_size, len(batch_frames))
+                )
+                
+                # Guardar todos los resultados del batch en el buffer
+                for frame_idx, result_bgr in batch_results.items():
+                    frames_to_write[frame_idx] = result_bgr
+                
+                # Escribir frames procesados en orden (escribir todos los que estén disponibles consecutivamente)
+                while next_write_idx in frames_to_write:
+                    out.write(frames_to_write.pop(next_write_idx))
+                    next_write_idx += 1
+                    processed_count += 1
+                
+                # Actualizar progreso
+                if total_frames > 0:
+                    progress = min(1.0, frame_count / total_frames)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Procesando: Frame {frame_count}/{total_frames} ({processed_count} procesados, {len(frames_to_write)} en buffer)")
+                else:
+                    progress_bar.progress(0.5)
+                    status_text.text(f"Procesando: Frame {frame_count} ({processed_count} procesados, {len(frames_to_write)} en buffer)")
+            
+            # Limitar frames procesados
+            if max_frames is not None and processed_count >= max_frames:
+                # Leer frames restantes y guardarlos en buffer
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if target_resolution:
+                        frame = resize_frame_if_needed(frame, width, height)
+                    frames_to_write[frame_count] = frame
+                    frame_count += 1
+                break
+        
+        # Procesar frames restantes en la cola
+        if len(frame_queue) > 0:
+            batch_frames = list(frame_queue)
+            frame_queue.clear()
+            
+            # Procesar frames restantes
+            batch_results = process_batch_frames(
+                batch_frames, pose_model, detr_model, detr_processor, device, conf,
+                point_size_multiplier, line_width_multiplier, detr_threshold,
+                width, height, max_workers=min(batch_size, len(batch_frames))
+            )
+            
+            for frame_idx, result_bgr in batch_results.items():
+                frames_to_write[frame_idx] = result_bgr
+        
+        # Escribir TODOS los frames restantes en orden
+        # Primero escribir todos los frames consecutivos disponibles
+        while next_write_idx in frames_to_write:
+            out.write(frames_to_write.pop(next_write_idx))
+            next_write_idx += 1
+            processed_count += 1
+        
+        # Si aún quedan frames en el buffer (puede haber gaps), escribir los restantes en orden
+        if frames_to_write:
+            # Ordenar los índices restantes y escribir en orden
+            remaining_indices = sorted(frames_to_write.keys())
+            for frame_idx in remaining_indices:
+                out.write(frames_to_write.pop(frame_idx))
+                processed_count += 1
+        
+        progress_bar.progress(1.0)
+        status_text.text(f"Procesamiento completado: {processed_count} frames procesados")
+        
+    except Exception as e:
+        st.error(f"Error procesando video: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        if output_path and os.path.exists(output_path):
+            os.unlink(output_path)
+        return None, 0, 0, 0, 0, 0
+    finally:
+        if cap is not None:
+            cap.release()
+        if out is not None:
+            out.release()
+        if tfile and os.path.exists(tfile.name):
+            os.unlink(tfile.name)
+    
+    return output_path, total_frames, processed_count, fps, width, height
+
+
+# ---------- Funciones auxiliares para UI ----------
+def show_image_metrics(image):
+    """Muestra las métricas de tamaño de una imagen"""
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-value">{image.size[0]} x {image.size[1]}</div>
+        <div class="metric-label">píxeles</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def show_result_with_download(result_image, person_count, file_name_prefix, file_extension="png"):
+    """Muestra el resultado de la inferencia con opción de descarga"""
+    st.image(result_image, caption="Pose Detection Result", width='stretch')
+    
+    # Estadísticas
+    st.markdown(f"""
+    <div class=\"metric-card\">
+        <div class=\"metric-value\">{person_count}</div>
+        <div class=\"metric-label\">personas detectadas</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Opción de descarga
+    buf = io.BytesIO()
+    result_image.save(buf, format=file_extension.upper())
+    byte_im = buf.getvalue()
+    
+    st.download_button(
+        label="Descargar Resultado",
+        data=byte_im,
+        file_name=f"pose_result_{file_name_prefix}.{file_extension}",
+        mime=f"image/{file_extension}"
+    )
+
+def process_and_show_pose(image, pose_model, detr_model, detr_processor, device, conf,
+                          point_size_multiplier, line_width_multiplier, detr_threshold,
+                          file_name_prefix, processing_message="Procesando..."):
+    """Procesa una imagen y muestra el resultado"""
+    with st.spinner(processing_message):
+        result_image, person_count, persons_details = infer_multi_person_pose(
+            image, pose_model, detr_model, detr_processor, device, conf,
+            point_size_multiplier, line_width_multiplier, detr_threshold
+        )
+        
+        if result_image is not None:
+            show_result_with_download(result_image, person_count, file_name_prefix)
+        else:
+            st.error("No se pudo procesar la imagen")
+        return result_image, person_count, persons_details
+
+def process_batch_frames(batch_frames, pose_model, detr_model, detr_processor, device, conf,
+                        point_size_multiplier, line_width_multiplier, detr_threshold,
+                        width, height, max_workers=None):
+    """Procesa un batch de frames en paralelo"""
+    if max_workers is None:
+        max_workers = min(len(batch_frames), 8)  # Limitar workers por defecto
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_frame = {
+            executor.submit(
+                process_single_frame,
+                (idx, pil, frame_bgr),
+                pose_model, detr_model, detr_processor, device, conf,
+                point_size_multiplier, line_width_multiplier,
+                detr_threshold, width, height
+            ): idx for idx, pil, frame_bgr in batch_frames
+        }
+        
+        batch_results = {}
+        for future in as_completed(future_to_frame):
+            try:
+                frame_idx, result_bgr = future.result()
+                batch_results[frame_idx] = result_bgr
+            except Exception as e:
+                frame_idx = future_to_frame[future]
+                # Usar frame original si hay error
+                original_frame = next((frame_bgr for idx, _, frame_bgr in batch_frames if idx == frame_idx), None)
+                if original_frame is not None:
+                    batch_results[frame_idx] = original_frame
+        
+        return batch_results
+
 
 def main():
     # Header principal con diseño mejorado
     st.markdown("""
     <div class="main-header">
-        <h1>Multi-Person Pose Estimation App</h1>
-        <p>Detección de poses de múltiples personas con DETR y Transformers</p>
+        <h1>Multi-Person Pose Detection</h1>
+        <p>Detección inteligente de poses humanas con IA avanzada</p>
     </div>
     """, unsafe_allow_html=True)
     
     # Sidebar con información y configuración
     with st.sidebar:
-        st.markdown("### Información")
+        st.markdown("### Diseño Visual")
         st.markdown("""
         <div class="card">
-        Esta aplicación utiliza modelos avanzados de IA para detectar y analizar múltiples personas en imágenes.
+        <strong>Visualización elegante del esqueleto humano</strong><br><br>
         
-        **Características:**
-        - Detección múltiple de personas con DETR
-        - Detección de 17 keypoints corporales por persona
-        - Visualización del esqueleto humano
-        - Soporte para múltiples formatos de imagen
-        - Captura de fotos con cámara
-        - Análisis completo de poses en escenas multi-persona
+        <strong>Verde:</strong> Brazo izquierdo<br>
+        <strong>Amarillo:</strong> Brazo derecho<br>
+        <strong>Azul:</strong> Pierna izquierda<br>
+        <strong>Rosa:</strong> Pierna derecha<br>
+        <strong>Rosa claro:</strong> Conexiones de cabeza<br><br>
+        
+        <em>Diseño colorido y profesional para una visualización clara de las poses detectadas.</em>
         </div>
         """, unsafe_allow_html=True)
         
-        st.markdown("### Configuración")
-        st.info("La aplicación detecta automáticamente todas las personas en la imagen y extrae sus poses individuales.")
-        
-        st.markdown("### Detección de Personas")
-        st.markdown("**Ajustes para evitar detecciones duplicadas:**")
-        
-        # Controles para DETR - CONTROL DE DETECCIONES DUPLICADAS
-        # DETR threshold: Controla qué tan estricto es el filtro de confianza
-        # • 0.9-0.95: Muy estricto - solo personas muy claras (recomendado)
-        # • 0.7-0.8: Moderado - puede detectar duplicados
-        # • < 0.6: Permisivo - muchas detecciones pero más ruido
-        detr_threshold = st.slider(
-            "Umbral de confianza DETR",
-            min_value=0.1,
-            max_value=0.99,
-            value=0.9,
-            step=0.05,
-            help="""
-            CONTROL DE DETECCIONES DUPLICADAS:
-            • 0.9-0.95: Muy estricto - solo personas muy claras (recomendado)
-            • 0.7-0.8: Moderado - puede detectar duplicados
-            • < 0.6: Permisivo - muchas detecciones pero más ruido
-            """
-        )
-        
-        # NMS threshold: Controla qué tan agresivo es el filtro de duplicados
-        # Valores más bajos = más agresivo eliminando solapamientos
-        nms_threshold = st.slider(
-            "Umbral NMS (eliminación duplicados)",
-            min_value=0.1,
-            max_value=0.9,
-            value=0.5,
-            step=0.05,
-            help="Umbral para eliminar detecciones duplicadas. Valores más bajos = más agresivo eliminando duplicados."
-        )
-        
-        st.markdown(f"""
-        <div class=\"card\">
-        <strong>Configuración de detección:</strong><br>
-        <strong>DETR threshold:</strong> {detr_threshold}<br>
-        <strong>NMS threshold:</strong> {nms_threshold}<br><br>
-        <small><em>Los cambios se aplicarán en la próxima imagen que analices</em></small>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("### Ajustes Visuales")
-        st.markdown("**Personaliza el tamaño de los elementos del esqueleto:**")
-        
-        # Contenedor para el slider de puntos
-        st.markdown('<div class="slider-container">', unsafe_allow_html=True)
-        point_size_multiplier = st.slider(
-            "Tamaño de puntos (keypoints)",
-            min_value=0.1,
-            max_value=3.0,
-            value=1.0,
-            step=0.1,
-            help="Ajusta el tamaño de los puntos de los keypoints. Valores más altos = puntos más grandes."
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("### Ajustes")
         
         # Contenedor para el slider de líneas
         st.markdown('<div class="slider-container">', unsafe_allow_html=True)
         line_width_multiplier = st.slider(
-            "Grosor de líneas (esqueleto)",
+            "Grosor de líneas del esqueleto",
             min_value=0.1,
             max_value=3.0,
             value=1.0,
             step=0.1,
-            help="Ajusta el grosor de las líneas del esqueleto. Valores más altos = líneas más gruesas."
+            help="Ajusta el grosor de las líneas del esqueleto"
         )
         st.markdown('</div>', unsafe_allow_html=True)
         
-        # Mostrar valores actuales con mejor formato
-        st.markdown(f"""
-        <div class=\"card\">
-        <strong>Configuración actual:</strong><br>
-        <strong>Puntos:</strong> {point_size_multiplier}x<br>
-        <strong>Líneas:</strong> {line_width_multiplier}x<br><br>
-        <small><em>Los cambios se aplicarán en la próxima imagen que analices</em></small>
-        </div>
-        """, unsafe_allow_html=True)
+        point_size_multiplier = st.slider(
+            "Tamaño de puntos",
+            min_value=0.1,
+            max_value=3.0,
+            value=1.0,
+            step=0.1,
+            help="Ajusta el tamaño de los puntos"
+        )
+        
+        detr_threshold = st.slider(
+            "Sensibilidad de detección",
+            min_value=0.1,
+            max_value=0.99,
+            value=0.9,
+            step=0.05,
+            help="Controla qué tan estricta es la detección de personas"
+        )
         
     
     # Cargar modelos
@@ -993,21 +1117,14 @@ def main():
         st.error("No se pudieron cargar los modelos. Verifica que los archivos estén disponibles.")
         return
     
-    st.markdown(f"""
-    <div class="status-success">
-        Modelos cargados exitosamente en {str(device).upper()}
-    </div>
-    """, unsafe_allow_html=True)
-    
     # Crear pestañas usando radio buttons
     st.markdown("### Modo de Análisis")
     mode = st.radio(
         "Selecciona el modo de análisis:",
-        ["Análisis de Imagen", "Tomar Foto"]
+        ["Análisis de Imagen", "Tomar Foto", "Análisis de Video"]
     )
     
     if mode == "Análisis de Imagen":
-        st.markdown("### Análisis de Imagen")
         
         col1, col2 = st.columns([1, 1])
         
@@ -1022,80 +1139,27 @@ def main():
             if uploaded_file is not None:
                 # Mostrar imagen original
                 image = Image.open(uploaded_file).convert("RGB")
-                st.image(image, caption="Imagen Original", use_column_width=True)
-                
-                # Información de la imagen
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-value">{image.size[0]} x {image.size[1]}</div>
-                    <div class="metric-label">píxeles</div>
-                </div>
-                """, unsafe_allow_html=True)
+                st.image(image, caption="Imagen Original", width='stretch')
+                show_image_metrics(image)
         
         with col2:
-            st.markdown("#### Resultado de la Predicción")
+            st.markdown("#### Resultado")
             
             if uploaded_file is not None:
                 if st.button("Analizar Pose", key="analyze_image"):
-                    with st.spinner("Procesando imagen..."):
-                        # Realizar inferencia multi-persona
-                        result_image, person_count, persons_details = infer_multi_person_pose(
-                            image, pose_model, detr_model, detr_processor, device, conf,
-                            point_size_multiplier, line_width_multiplier, detr_threshold, nms_threshold
-                        )
-                        
-                        if result_image is not None:
-                            # Mostrar resultado
-                            st.image(result_image, caption="Pose Detection Result", use_column_width=True)
-                            
-                            # Estadísticas
-                            st.markdown(f"""
-                            <div class=\"metric-card\">
-                                <div class=\"metric-value\">{person_count}</div>
-                                <div class=\"metric-label\">personas detectadas</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                            # Mostrar tabla de keypoints y confianzas por persona
-                            if persons_details:
-                                st.markdown("### Detalle de keypoints y confianzas")
-                                for p_idx, details in enumerate(persons_details, start=1):
-                                    with st.expander(f"Persona {p_idx} - bbox: [x1={details['bbox'][0]:.1f}, y1={details['bbox'][1]:.1f}, x2={details['bbox'][2]:.1f}, y2={details['bbox'][3]:.1f}]"):
-                                        rows = []
-                                        for k in range(min(17, len(details['keypoints']))):
-                                            x, y = details['keypoints'][k]
-                                            conf_score = details['confidences'][k] if k < len(details['confidences']) else 0.0
-                                            rows.append({
-                                                'keypoint': k + 1,
-                                                'x': None if x is None else (float('nan') if (x != x) else round(float(x), 2)),
-                                                'y': None if y is None else (float('nan') if (y != y) else round(float(y), 2)),
-                                                'confidence': round(float(conf_score), 3)
-                                            })
-                                        st.table(rows)
-                            
-                            # Opción de descarga
-                            buf = io.BytesIO()
-                            result_image.save(buf, format="PNG")
-                            byte_im = buf.getvalue()
-                            
-                            st.download_button(
-                                label="Descargar Resultado",
-                                data=byte_im,
-                                file_name=f"pose_result_{uploaded_file.name}",
-                                mime="image/png"
-                            )
-                        else:
-                            st.error("No se pudo procesar la imagen")
+                    process_and_show_pose(
+                        image, pose_model, detr_model, detr_processor, device, conf,
+                        point_size_multiplier, line_width_multiplier, detr_threshold,
+                        uploaded_file.name, "Procesando imagen..."
+                    )
             else:
                 st.markdown("""
                 <div class=\"camera-container\">
                     <h4>Sube una imagen para comenzar</h4>
-                    <p>Selecciona una imagen desde tu dispositivo para analizar la pose</p>
                 </div>
                 """, unsafe_allow_html=True)
     
     elif mode == "Tomar Foto":
-        st.markdown("### Tomar Foto con Cámara")
         
         col1, col2 = st.columns([1, 1])
         
@@ -1110,79 +1174,21 @@ def main():
                 image = Image.open(camera_photo).convert("RGB")
                 
                 # Mostrar imagen capturada
-                st.image(image, caption="Foto Capturada", use_column_width=True)
-                
-                # Información de la imagen
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-value">{image.size[0]} x {image.size[1]}</div>
-                    <div class="metric-label">píxeles</div>
-                </div>
-                """, unsafe_allow_html=True)
+                st.image(image, caption="Foto Capturada", width='stretch')
+                show_image_metrics(image)
                 
                 # Botón de análisis en la misma columna
                 if st.button("Analizar Pose", key="analyze_camera_photo"):
-                    with st.spinner("Procesando foto..."):
-                        # Realizar inferencia multi-persona
-                        result_image, person_count, persons_details = infer_multi_person_pose(
-                            image, pose_model, detr_model, detr_processor, device, conf,
-                            point_size_multiplier, line_width_multiplier, detr_threshold, nms_threshold
-                        )
-                        
-                        if result_image is not None:
-                            # Mostrar resultado
-                            st.image(result_image, caption="Pose Detection Result", use_column_width=True)
-                            
-                            # Estadísticas
-                            st.markdown(f"""
-                            <div class=\"metric-card\">
-                                <div class=\"metric-value\">{person_count}</div>
-                                <div class=\"metric-label\">personas detectadas</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-
-                            # Mostrar tabla de keypoints y confianzas por persona
-                            if persons_details:
-                                st.markdown("### Detalle de keypoints y confianzas")
-                                for p_idx, details in enumerate(persons_details, start=1):
-                                    with st.expander(f"Persona {p_idx} - bbox: [x1={details['bbox'][0]:.1f}, y1={details['bbox'][1]:.1f}, x2={details['bbox'][2]:.1f}, y2={details['bbox'][3]:.1f}]"):
-                                        rows = []
-                                        for k in range(min(17, len(details['keypoints']))):
-                                            x, y = details['keypoints'][k]
-                                            conf_score = details['confidences'][k] if k < len(details['confidences']) else 0.0
-                                            rows.append({
-                                                'keypoint': k + 1,
-                                                'x': None if x is None else (float('nan') if (x != x) else round(float(x), 2)),
-                                                'y': None if y is None else (float('nan') if (y != y) else round(float(y), 2)),
-                                                'confidence': round(float(conf_score), 3)
-                                            })
-                                        st.table(rows)
-                            
-                            # Opción de descarga
-                            buf = io.BytesIO()
-                            result_image.save(buf, format="PNG")
-                            byte_im = buf.getvalue()
-                            
-                            st.download_button(
-                                label="Descargar Resultado",
-                                data=byte_im,
-                                file_name=f"pose_result_camera_{int(time.time())}.png",
-                                mime="image/png"
-                            )
-                        else:
-                            st.error("No se pudo procesar la foto")
+                    file_name = f"camera_{int(time.time())}"
+                    process_and_show_pose(
+                        image, pose_model, detr_model, detr_processor, device, conf,
+                        point_size_multiplier, line_width_multiplier, detr_threshold,
+                        file_name, "Procesando foto..."
+                    )
             else:
                 st.markdown("""
                 <div class=\"camera-container\">
-                    <h4>Tomar Foto</h4>
-                    <p>Usa el widget de cámara para tomar una foto y analizar la pose</p>
-                    <p><strong>Características:</strong></p>
-                    <ul>
-                        <li>Captura instantánea con la cámara</li>
-                        <li>Análisis inmediato de la pose</li>
-                        <li>Descarga del resultado</li>
-                        <li>Fácil de usar</li>
-                    </ul>
+                    <h4>Toma una foto para comenzar</h4>
                 </div>
                 """, unsafe_allow_html=True)
         
@@ -1190,31 +1196,168 @@ def main():
             st.markdown("#### Instrucciones")
             st.markdown("""
             <div class=\"camera-container\">
-                <h4>Cómo Usar la Cámara</h4>
-                <p><strong>Pasos para analizar una pose:</strong></p>
+                <h4>Cómo usar la cámara</h4>
                 <ol>
                     <li>Haz clic en "Toma una foto"</li>
                     <li>Permite el acceso a la cámara</li>
                     <li>Posiciona la persona en el marco</li>
-                    <li>Haz clic en "Tomar foto"</li>
                     <li>Presiona "Analizar Pose"</li>
-                    <li>Descarga el resultado</li>
                 </ol>
                 <p><strong>Consejos:</strong></p>
                 <ul>
-                    <li>Buena iluminación mejora la detección</li>
-                    <li>Persona completa en el marco</li>
-                    <li>Fondo simple funciona mejor</li>
+                    <li>Buena iluminación</li>
+                    <li>Persona completa visible</li>
+                    <li>Fondo simple</li>
                 </ul>
             </div>
             """, unsafe_allow_html=True)
     
-    # Footer mejorado
+    elif mode == "Análisis de Video":
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("#### Subir Video")
+            uploaded_video = st.file_uploader(
+                "Selecciona un video",
+                type=['mp4', 'avi', 'mov', 'mkv', 'webm'],
+                help="Formatos soportados: MP4, AVI, MOV, MKV, WEBM"
+            )
+            
+            if uploaded_video is not None:
+                # Mostrar información del video
+                st.video(uploaded_video)
+                
+                # Configuración de procesamiento
+                st.markdown("#### Configuración de Procesamiento")
+                
+                max_frames_option = st.selectbox(
+                    "Límite de frames",
+                    ["Todos los frames", "50 frames", "100 frames", "200 frames", "500 frames"],
+                    help="Limita el número de frames a procesar para videos largos"
+                )
+                
+                max_frames_map = {
+                    "Todos los frames": None,
+                    "50 frames": 50,
+                    "100 frames": 100,
+                    "200 frames": 200,
+                    "500 frames": 500
+                }
+                max_frames = max_frames_map[max_frames_option]
+                
+                frame_skip = st.slider(
+                    "Procesar cada N frames",
+                    min_value=1,
+                    max_value=10,
+                    value=1,
+                    help="1 = todos los frames, 2 = cada 2 frames, etc. Útil para videos largos"
+                )
+                
+                batch_size = st.slider(
+                    "Tamaño del batch (procesamiento paralelo)",
+                    min_value=1,
+                    max_value=16,
+                    value=8,
+                    step=1,
+                    help="Número de frames a procesar en paralelo. Valores más altos = más rápido pero más uso de memoria. Recomendado: 4-8 para reducir uso de memoria. El video se procesa en streaming para optimizar recursos."
+                )
+                
+                # Opción de resolución para procesamiento más rápido
+                resolution_option = st.selectbox(
+                    "Resolución de procesamiento (para mayor velocidad)",
+                    ["Original", "1080p (1920x1080)", "720p (1280x720)", "480p (854x480)", "360p (640x360)", "240p (426x240)"],
+                    index=2,  # Por defecto 720p para balance velocidad/calidad
+                    help="Reducir la resolución acelera significativamente el procesamiento. Recomendado: 720p o 480p para mejor velocidad."
+                )
+                
+                # Obtener resolución objetivo
+                resolution_map = {
+                    "Original": None,
+                    "1080p (1920x1080)": (1920, 1080),
+                    "720p (1280x720)": (1280, 720),
+                    "480p (854x480)": (854, 480),
+                    "360p (640x360)": (640, 360),
+                    "240p (426x240)": (426, 240)
+                }
+                target_resolution = resolution_map[resolution_option]
+                
+                st.info(f"""
+                **Configuración:** {max_frames_option} | Frame skip: {frame_skip} | Resolución: {resolution_option}
+                
+                **Optimizado para velocidad y eficiencia**
+                """)
+        
+        with col2:
+            st.markdown("#### Resultado")
+            
+            if uploaded_video is not None:
+                if st.button("Procesar Video", key="process_video"):
+                    # Resetear el stream del archivo
+                    uploaded_video.seek(0)
+                    
+                    with st.spinner("Procesando video... Esto puede tardar varios minutos."):
+                        try:
+                            # Crear un BytesIO wrapper para el archivo
+                            video_bytes_io = io.BytesIO(uploaded_video.read())
+                            uploaded_video.seek(0)  # Resetear para mostrar el video original
+                            
+                            output_path, total_frames, processed_frames, fps, width, height = process_video(
+                                video_bytes_io,
+                                pose_model, detr_model, detr_processor, device, conf,
+                                point_size_multiplier, line_width_multiplier,
+                                detr_threshold,
+                                max_frames=max_frames, frame_skip=frame_skip,
+                                batch_size=batch_size, target_resolution=target_resolution
+                            )
+                            
+                            if output_path and os.path.exists(output_path):
+                                # Leer el video procesado
+                                with open(output_path, 'rb') as video_file:
+                                    video_bytes = video_file.read()
+                                
+                                # Mostrar estadísticas
+                                st.markdown(f"""
+                                <div class=\"metric-card\">
+                                    <div class=\"metric-value\">{processed_frames}</div>
+                                    <div class=\"metric-label\">frames procesados</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                
+                                # Mostrar video procesado
+                                st.video(video_bytes)
+                                
+                                # Opción de descarga
+                                st.download_button(
+                                    label="Descargar Video Procesado",
+                                    data=video_bytes,
+                                    file_name=f"pose_result_{uploaded_video.name}",
+                                    mime="video/mp4"
+                                )
+                                
+                                # Limpiar archivo temporal después de un tiempo
+                                # (Streamlit manejará la limpieza cuando se recargue la página)
+                            else:
+                                st.error("No se pudo procesar el video. Verifica que el formato sea compatible.")
+                                
+                        except Exception as e:
+                            st.error(f"Error procesando el video: {e}")
+                            import traceback
+                            st.code(traceback.format_exc())
+            else:
+                st.markdown("""
+                <div class=\"camera-container\">
+                    <h4>Sube un video para comenzar</h4>
+                    <p>Selecciona un video desde tu dispositivo para analizar las poses</p>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # Footer
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666; padding: 2rem;'>
-        <h4>Desarrollado con Streamlit y PyTorch</h4>
-        <p>Pose Estimation App - Detección de poses humanas con IA</p>
+        <p>Multi-Person Pose Detection </p>
     </div>
     """, unsafe_allow_html=True)
 
