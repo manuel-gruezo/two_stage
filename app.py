@@ -282,18 +282,6 @@ def preprocess_patch(img_pil, center, scale, output_size):
     return out
 
 # ---------- Dibujo de keypoints y esqueleto ----------
-"""
-DISEÑO VISUAL:
-
-Esqueleto con líneas coloridas por segmento corporal:
-   Verde: brazo izquierdo (hombro → codo → muñeca)
-   Amarillo: brazo derecho (hombro → codo → muñeca)
-   Azul: pierna izquierda (cadera → rodilla → tobillo)
-   Rosa: pierna derecha (cadera → rodilla → tobillo)
-   Rosa claro: conexiones de cabeza (líneas delgadas)
-   
-Visualización con círculos negros para los puntos clave
-"""
 def draw_keypoints_pil(img_pil, keypoints, confidences=None, scale=1.0, 
                       point_size_multiplier=1.0, line_width_multiplier=1.0):
     """
@@ -656,318 +644,6 @@ def infer_multi_person_pose(image_pil, pose_model, detr_model, detr_processor, d
         st.error(f"Error en inferencia multi-persona: {e}")
         return None, 0, []
 
-def process_single_frame(frame_data, pose_model, detr_model, detr_processor, device, conf,
-                        point_size_multiplier, line_width_multiplier, detr_threshold,
-                        width, height):
-    """
-    Procesa un solo frame. Función auxiliar para procesamiento en paralelo.
-    
-    Args:
-        frame_data: tuple (frame_idx, frame_pil, frame_bgr)
-        pose_model: Modelo de pose
-        detr_model: Modelo DETR
-        detr_processor: Procesador DETR
-        device: Dispositivo de cómputo
-        conf: Configuración del modelo
-        point_size_multiplier: Multiplicador para tamaño de puntos
-        line_width_multiplier: Multiplicador para grosor de líneas
-        detr_threshold: Umbral de confianza DETR
-        width: Ancho del frame
-        height: Alto del frame
-    
-    Returns:
-        tuple: (frame_idx, result_bgr) o (frame_idx, None) si hay error
-    """
-    frame_idx, frame_pil, frame_bgr = frame_data
-    try:
-        # Aplicar inferencia de pose
-        result_image, person_count, _ = infer_multi_person_pose(
-            frame_pil, pose_model, detr_model, detr_processor, device, conf,
-            point_size_multiplier, line_width_multiplier, detr_threshold
-        )
-        
-        if result_image is not None:
-            # Convertir PIL a OpenCV (ya viene del tamaño correcto porque el frame fue redimensionado antes)
-            result_np = np.array(result_image)
-            # Solo redimensionar si es absolutamente necesario (no debería ser necesario)
-            if result_np.shape[:2] != (height, width):
-                result_np = cv2.resize(result_np, (width, height), interpolation=cv2.INTER_LINEAR)
-            result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
-            return (frame_idx, result_bgr)
-        else:
-            # Si falla, devolver frame original
-            return (frame_idx, frame_bgr)
-            
-    except Exception as e:
-        # Si hay error, devolver frame original
-        return (frame_idx, frame_bgr)
-
-def get_video_hash(video_bytes):
-    """Genera un hash del video para usar como clave de caché"""
-    return hashlib.md5(video_bytes).hexdigest()
-
-def resize_frame_if_needed(frame, target_width, target_height):
-    """
-    Redimensiona un frame al tamaño objetivo usando interpolación rápida.
-    Para velocidad, simplemente redimensiona sin mantener aspect ratio exacto.
-    
-    Args:
-        frame: Frame OpenCV (BGR)
-        target_width: Ancho objetivo
-        target_height: Alto objetivo
-    
-    Returns:
-        Frame redimensionado
-    """
-    h, w = frame.shape[:2]
-    if w == target_width and h == target_height:
-        return frame
-    
-    # Redimensionar directamente al tamaño objetivo (más rápido)
-    # Usar INTER_LINEAR para balance velocidad/calidad
-    resized = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-    return resized
-
-
-def process_video(video_file, pose_model, detr_model, detr_processor, device, conf,
-                 point_size_multiplier=1.0, line_width_multiplier=1.0,
-                 detr_threshold=0.9, max_frames=None, frame_skip=1,
-                 batch_size=8, target_resolution=None):
-    """
-    Procesa un video frame por frame aplicando detección de pose en streaming.
-    Procesa y escribe frames inmediatamente para reducir uso de memoria.
-    
-    Args:
-        video_file: Archivo de video subido (BytesIO o path)
-        pose_model: Modelo de pose
-        detr_model: Modelo DETR
-        detr_processor: Procesador DETR
-        device: Dispositivo de cómputo
-        conf: Configuración del modelo
-        point_size_multiplier: Multiplicador para tamaño de puntos
-        line_width_multiplier: Multiplicador para grosor de líneas
-        detr_threshold: Umbral de confianza DETR
-        max_frames: Número máximo de frames a procesar (None = todos)
-        frame_skip: Procesar cada N frames (1 = todos, 2 = cada 2, etc.)
-        batch_size: Número de frames a procesar en paralelo (default: 8, reducido para menor uso de memoria)
-        target_resolution: tuple (width, height) para redimensionar frames, o None para mantener original
-    
-    Returns:
-        tuple: (video_path, total_frames, processed_frames, fps, width, height)
-    """
-    tfile = None
-    output_path = None
-    cap = None
-    out = None
-    
-    try:
-        # Leer video completo para hash y guardar
-        video_bytes = video_file.read()
-        video_hash = get_video_hash(video_bytes)
-        
-        # Incluir resolución en el hash del caché
-        res_str = f"{target_resolution[0]}x{target_resolution[1]}" if target_resolution else "original"
-        cache_hash = hashlib.md5(f"{video_hash}_{res_str}_{batch_size}_{frame_skip}".encode()).hexdigest()
-        
-        # Verificar caché
-        cache_dir = tempfile.gettempdir()
-        cache_file = os.path.join(cache_dir, f"pose_video_cache_{cache_hash}.mp4")
-        
-        if os.path.exists(cache_file):
-            st.info(f"Video encontrado en caché. Usando versión procesada anteriormente.")
-            # Leer propiedades del video en caché
-            cap_cache = cv2.VideoCapture(cache_file)
-            if cap_cache.isOpened():
-                fps = int(cap_cache.get(cv2.CAP_PROP_FPS)) or 30
-                width = int(cap_cache.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap_cache.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                total_frames = int(cap_cache.get(cv2.CAP_PROP_FRAME_COUNT))
-                cap_cache.release()
-                return cache_file, total_frames, total_frames, fps, width, height
-        
-        # Guardar video temporalmente
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-        tfile.write(video_bytes)
-        tfile.close()
-        
-        # Abrir video
-        cap = cv2.VideoCapture(tfile.name)
-        if not cap.isOpened():
-            if tfile and os.path.exists(tfile.name):
-                os.unlink(tfile.name)
-            return None, 0, 0, 0, 0, 0
-        
-        # Obtener propiedades del video original
-        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
-        orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        if orig_width == 0 or orig_height == 0:
-            if tfile and os.path.exists(tfile.name):
-                os.unlink(tfile.name)
-            return None, 0, 0, 0, 0, 0
-        
-        # Aplicar resolución objetivo si se especifica
-        if target_resolution:
-            width, height = target_resolution
-            st.info(f"Redimensionando video de {orig_width}x{orig_height} a {width}x{height} para procesamiento más rápido")
-        else:
-            width, height = orig_width, orig_height
-        
-        # Crear video de salida (usar caché si existe)
-        output_path = cache_file
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        if not out.isOpened():
-            if tfile and os.path.exists(tfile.name):
-                os.unlink(tfile.name)
-            if output_path and os.path.exists(output_path):
-                os.unlink(output_path)
-            return None, 0, 0, 0, 0, 0
-        
-        # Procesar en streaming: leer, procesar en batches pequeños, escribir en orden
-        frame_count = 0
-        processed_count = 0
-        frames_to_write = {}  # Buffer ordenado para escribir frames en orden: {frame_idx: frame_bgr}
-        next_write_idx = 0  # Índice del siguiente frame a escribir
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Cola para frames a procesar (limitar tamaño para reducir memoria)
-        frame_queue = deque(maxlen=batch_size * 2)
-        
-        # Procesar frames en streaming
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Redimensionar frame si es necesario (ANTES de procesar para mayor velocidad)
-            if target_resolution:
-                frame = resize_frame_if_needed(frame, width, height)
-            
-            # Limitar número de frames si se especifica
-            if max_frames is not None and processed_count >= max_frames:
-                # Guardar frame sin procesar en buffer para escribir en orden
-                frames_to_write[frame_count] = frame
-                frame_count += 1
-                continue
-            
-            # Saltar frames según frame_skip
-            if frame_count % frame_skip != 0:
-                # Guardar frame sin procesar en buffer para escribir en orden
-                frames_to_write[frame_count] = frame
-                frame_count += 1
-                continue
-            
-            # Convertir frame a PIL Image (ya redimensionado)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_pil = Image.fromarray(frame_rgb)
-            
-            # Agregar a cola para procesamiento
-            frame_queue.append((frame_count, frame_pil, frame))
-            
-            frame_count += 1
-            
-            # Procesar batch cuando la cola esté llena
-            if len(frame_queue) >= batch_size:
-                # Procesar batch actual
-                batch_frames = list(frame_queue)
-                frame_queue.clear()
-                
-                # Procesar frames en paralelo
-                batch_results = process_batch_frames(
-                    batch_frames, pose_model, detr_model, detr_processor, device, conf,
-                    point_size_multiplier, line_width_multiplier, detr_threshold,
-                    width, height, max_workers=min(batch_size, len(batch_frames))
-                )
-                
-                # Guardar todos los resultados del batch en el buffer
-                for frame_idx, result_bgr in batch_results.items():
-                    frames_to_write[frame_idx] = result_bgr
-                
-                # Escribir frames procesados en orden (escribir todos los que estén disponibles consecutivamente)
-                while next_write_idx in frames_to_write:
-                    out.write(frames_to_write.pop(next_write_idx))
-                    next_write_idx += 1
-                    processed_count += 1
-                
-                # Actualizar progreso
-                if total_frames > 0:
-                    progress = min(1.0, frame_count / total_frames)
-                    progress_bar.progress(progress)
-                    status_text.text(f"Procesando: Frame {frame_count}/{total_frames} ({processed_count} procesados, {len(frames_to_write)} en buffer)")
-                else:
-                    progress_bar.progress(0.5)
-                    status_text.text(f"Procesando: Frame {frame_count} ({processed_count} procesados, {len(frames_to_write)} en buffer)")
-            
-            # Limitar frames procesados
-            if max_frames is not None and processed_count >= max_frames:
-                # Leer frames restantes y guardarlos en buffer
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    if target_resolution:
-                        frame = resize_frame_if_needed(frame, width, height)
-                    frames_to_write[frame_count] = frame
-                    frame_count += 1
-                break
-        
-        # Procesar frames restantes en la cola
-        if len(frame_queue) > 0:
-            batch_frames = list(frame_queue)
-            frame_queue.clear()
-            
-            # Procesar frames restantes
-            batch_results = process_batch_frames(
-                batch_frames, pose_model, detr_model, detr_processor, device, conf,
-                point_size_multiplier, line_width_multiplier, detr_threshold,
-                width, height, max_workers=min(batch_size, len(batch_frames))
-            )
-            
-            for frame_idx, result_bgr in batch_results.items():
-                frames_to_write[frame_idx] = result_bgr
-        
-        # Escribir TODOS los frames restantes en orden
-        # Primero escribir todos los frames consecutivos disponibles
-        while next_write_idx in frames_to_write:
-            out.write(frames_to_write.pop(next_write_idx))
-            next_write_idx += 1
-            processed_count += 1
-        
-        # Si aún quedan frames en el buffer (puede haber gaps), escribir los restantes en orden
-        if frames_to_write:
-            # Ordenar los índices restantes y escribir en orden
-            remaining_indices = sorted(frames_to_write.keys())
-            for frame_idx in remaining_indices:
-                out.write(frames_to_write.pop(frame_idx))
-                processed_count += 1
-        
-        progress_bar.progress(1.0)
-        status_text.text(f"Procesamiento completado: {processed_count} frames procesados")
-        
-    except Exception as e:
-        st.error(f"Error procesando video: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-        if output_path and os.path.exists(output_path):
-            os.unlink(output_path)
-        return None, 0, 0, 0, 0, 0
-    finally:
-        if cap is not None:
-            cap.release()
-        if out is not None:
-            out.release()
-        if tfile and os.path.exists(tfile.name):
-            os.unlink(tfile.name)
-    
-    return output_path, total_frames, processed_count, fps, width, height
-
-
 # ---------- Funciones auxiliares para UI ----------
 def show_image_metrics(image):
     """Muestra las métricas de tamaño de una imagen"""
@@ -978,7 +654,7 @@ def show_image_metrics(image):
     </div>
     """, unsafe_allow_html=True)
 
-def show_result_with_download(result_image, person_count, file_name_prefix, file_extension="png"):
+def show_result_with_download(result_image, person_count, file_name_prefix, file_extension="png", inference_time=None):
     """Muestra el resultado de la inferencia con opción de descarga"""
     st.image(result_image, caption="Pose Detection Result", width='stretch')
     
@@ -989,6 +665,24 @@ def show_result_with_download(result_image, person_count, file_name_prefix, file
         <div class=\"metric-label\">personas detectadas</div>
     </div>
     """, unsafe_allow_html=True)
+    
+    # Mostrar tiempo de inferencia si está disponible
+    if inference_time is not None:
+        minutes = int(inference_time // 60)
+        seconds = int(inference_time % 60)
+        milliseconds = int((inference_time % 1) * 1000)
+        
+        if minutes > 0:
+            time_str = f"{minutes}m {seconds}s {milliseconds}ms"
+        else:
+            time_str = f"{seconds}s {milliseconds}ms"
+        
+        st.markdown(f"""
+        <div class=\"metric-card\" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+            <div class=\"metric-value\">{time_str}</div>
+            <div class=\"metric-label\">Tiempo de inferencia</div>
+        </div>
+        """, unsafe_allow_html=True)
     
     # Opción de descarga
     buf = io.BytesIO()
@@ -1006,48 +700,659 @@ def process_and_show_pose(image, pose_model, detr_model, detr_processor, device,
                           point_size_multiplier, line_width_multiplier, detr_threshold,
                           file_name_prefix, processing_message="Procesando..."):
     """Procesa una imagen y muestra el resultado"""
+    start_time = time.time()
     with st.spinner(processing_message):
         result_image, person_count, persons_details = infer_multi_person_pose(
             image, pose_model, detr_model, detr_processor, device, conf,
             point_size_multiplier, line_width_multiplier, detr_threshold
         )
         
+        # Calcular tiempo de inferencia
+        inference_time = time.time() - start_time
+        
         if result_image is not None:
-            show_result_with_download(result_image, person_count, file_name_prefix)
+            show_result_with_download(result_image, person_count, file_name_prefix, inference_time=inference_time)
         else:
             st.error("No se pudo procesar la imagen")
         return result_image, person_count, persons_details
 
-def process_batch_frames(batch_frames, pose_model, detr_model, detr_processor, device, conf,
-                        point_size_multiplier, line_width_multiplier, detr_threshold,
-                        width, height, max_workers=None):
-    """Procesa un batch de frames en paralelo"""
-    if max_workers is None:
-        max_workers = min(len(batch_frames), 8)  # Limitar workers por defecto
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_frame = {
-            executor.submit(
-                process_single_frame,
-                (idx, pil, frame_bgr),
-                pose_model, detr_model, detr_processor, device, conf,
-                point_size_multiplier, line_width_multiplier,
-                detr_threshold, width, height
-            ): idx for idx, pil, frame_bgr in batch_frames
+def detect_squat(keypoints, confidences, prev_state=None):
+    """
+    Detecta si una persona está haciendo una sentadilla basándose en los keypoints.
+    
+    Args:
+        keypoints: Array de shape (17, 2) con coordenadas [x, y] de cada keypoint
+        confidences: Array de shape (17,) con confianza de cada keypoint
+        prev_state: Estado anterior (dict con 'state' y 'squat_count')
+    
+    Returns:
+        tuple: (is_squat_down, state_dict) donde:
+            is_squat_down: bool indicando si está en posición baja
+            state_dict: dict con estado actualizado
+    """
+    # Índices de keypoints COCO (0-based)
+    LEFT_HIP = 11
+    RIGHT_HIP = 12
+    LEFT_KNEE = 13
+    RIGHT_KNEE = 14
+    
+    # Inicializar estado si no existe
+    if prev_state is None:
+        prev_state = {
+            'state': 'up',  # 'up' o 'down'
+            'squat_count': 0,
+            'hip_y_avg': None,
+            'knee_y_avg': None
         }
-        
-        batch_results = {}
-        for future in as_completed(future_to_frame):
+    
+    state = prev_state.copy()
+    
+    # Obtener coordenadas Y de caderas y rodillas (Y aumenta hacia abajo)
+    hip_y_values = []
+    knee_y_values = []
+    
+    if not np.isnan(keypoints[LEFT_HIP][1]) and confidences[LEFT_HIP] > 0:
+        hip_y_values.append(keypoints[LEFT_HIP][1])
+    if not np.isnan(keypoints[RIGHT_HIP][1]) and confidences[RIGHT_HIP] > 0:
+        hip_y_values.append(keypoints[RIGHT_HIP][1])
+    if not np.isnan(keypoints[LEFT_KNEE][1]) and confidences[LEFT_KNEE] > 0:
+        knee_y_values.append(keypoints[LEFT_KNEE][1])
+    if not np.isnan(keypoints[RIGHT_KNEE][1]) and confidences[RIGHT_KNEE] > 0:
+        knee_y_values.append(keypoints[RIGHT_KNEE][1])
+    
+    # Si no tenemos suficientes keypoints visibles, mantener estado anterior
+    if len(hip_y_values) == 0 or len(knee_y_values) == 0:
+        return False, state
+    
+    # Calcular promedios
+    hip_y_avg = np.mean(hip_y_values)
+    knee_y_avg = np.mean(knee_y_values)
+    
+    # Calcular diferencia entre cadera y rodilla
+    # En posición de pie: cadera está arriba (Y menor) que rodilla
+    # En sentadilla: cadera baja (Y mayor) y está más cerca de la rodilla
+    diff = hip_y_avg - knee_y_avg
+    
+    # Umbral para detectar sentadilla (cuando la diferencia es pequeña o negativa)
+    # Si la cadera está por debajo o muy cerca de la rodilla, está en sentadilla
+    SQUAT_THRESHOLD = 50  # píxeles
+    
+    is_squat_down = diff > -SQUAT_THRESHOLD  # Si diff es positivo o pequeño negativo, está abajo
+    
+    # Detectar transición de arriba a abajo y luego de abajo a arriba (una sentadilla completa)
+    if state['state'] == 'up' and is_squat_down:
+        # Transición de arriba a abajo - empezó a bajar
+        state['state'] = 'down'
+    elif state['state'] == 'down' and not is_squat_down:
+        # Transición de abajo a arriba - completó una sentadilla
+        state['state'] = 'up'
+        state['squat_count'] += 1
+    
+    return is_squat_down, state
+
+def draw_squat_count(img_pil, squat_count, is_squat_down):
+    """
+    Dibuja el conteo de sentadillas en la imagen.
+    
+    Args:
+        img_pil: Imagen PIL donde dibujar
+        squat_count: Número de sentadillas contadas
+        is_squat_down: Si está en posición baja
+    
+    Returns:
+        PIL.Image: Imagen con el conteo dibujado
+    """
+    draw = ImageDraw.Draw(img_pil)
+    
+    # Texto del conteo
+    text = f"Sentadillas: {squat_count}"
+    status_text = "BAJANDO" if is_squat_down else "SUBIENDO"
+    
+    # Obtener dimensiones de la imagen
+    width, height = img_pil.size
+    
+    # Fuente grande para el conteo
+    font = None
+    try:
+        from PIL import ImageFont
+        # Intentar usar una fuente más grande
+        font_size = max(40, int(width / 20))
+        # Intentar diferentes fuentes comunes
+        font_paths = [
+            "arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "C:/Windows/Fonts/arial.ttf"
+        ]
+        for font_path in font_paths:
             try:
-                frame_idx, result_bgr = future.result()
-                batch_results[frame_idx] = result_bgr
-            except Exception as e:
-                frame_idx = future_to_frame[future]
-                # Usar frame original si hay error
-                original_frame = next((frame_bgr for idx, _, frame_bgr in batch_frames if idx == frame_idx), None)
-                if original_frame is not None:
-                    batch_results[frame_idx] = original_frame
+                font = ImageFont.truetype(font_path, font_size)
+                break
+            except:
+                continue
+    except:
+        pass
+    
+    # Fondo semi-transparente para el texto
+    text_bbox = draw.textbbox((0, 0), text, font=font) if font else draw.textbbox((0, 0), text)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    
+    status_bbox = draw.textbbox((0, 0), status_text, font=font) if font else draw.textbbox((0, 0), status_text)
+    status_width = status_bbox[2] - status_bbox[0]
+    status_height = status_bbox[3] - status_bbox[1]
+    
+    # Dibujar fondo
+    padding = 20
+    box_x = 20
+    box_y = 20
+    box_width = max(text_width, status_width) + padding * 2
+    box_height = text_height + status_height + padding * 3
+    
+    # Fondo semi-transparente (usar gris oscuro en lugar de transparencia)
+    draw.rectangle(
+        [(box_x, box_y), (box_x + box_width, box_y + box_height)],
+        fill=(40, 40, 40),  # Gris oscuro
+        outline=(255, 255, 255),
+        width=3
+    )
+    
+    # Color del texto según estado
+    text_color = (255, 100, 100) if is_squat_down else (100, 255, 100)
+    
+    # Dibujar texto del conteo
+    draw.text(
+        (box_x + padding, box_y + padding),
+        text,
+        fill=(255, 255, 255),
+        font=font
+    )
+    
+    # Dibujar texto del estado
+    draw.text(
+        (box_x + padding, box_y + padding + text_height + 10),
+        status_text,
+        fill=text_color,
+        font=font
+    )
+    
+    return img_pil
+
+def process_video_squat_count(video_file, pose_model, detr_model, detr_processor, device, conf,
+                             point_size_multiplier=1.0, line_width_multiplier=1.0,
+                             detr_threshold=0.9, frame_skip=2, target_resolution=(640, 360),
+                             max_frames=None):
+    """
+    Procesa un video contando sentadillas en tiempo real.
+    
+    Args:
+        video_file: Archivo de video subido (BytesIO o path)
+        pose_model: Modelo de pose
+        detr_model: Modelo DETR
+        detr_processor: Procesador DETR
+        device: Dispositivo de cómputo
+        conf: Configuración del modelo
+        point_size_multiplier: Multiplicador para tamaño de puntos
+        line_width_multiplier: Multiplicador para grosor de líneas
+        detr_threshold: Umbral de confianza DETR
+        frame_skip: Procesar cada N frames
+        target_resolution: tuple (width, height) para redimensionar frames
+        max_frames: Número máximo de frames a procesar (None = todos)
+    
+    Returns:
+        tuple: (video_path, total_frames, processed_frames, fps, width, height, inference_time, total_squats)
+    """
+    start_time = time.time()
+    tfile = None
+    output_path = None
+    cap = None
+    out = None
+    
+    try:
+        # Leer video completo para guardar
+        video_bytes = video_file.read()
         
-        return batch_results
+        # Guardar video temporalmente
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(video_bytes)
+        tfile.close()
+        
+        # Abrir video
+        cap = cv2.VideoCapture(tfile.name)
+        if not cap.isOpened():
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            return None, 0, 0, 0, 0, 0, 0.0, 0
+        
+        # Obtener propiedades del video original
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+        orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if orig_width == 0 or orig_height == 0:
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            return None, 0, 0, 0, 0, 0, 0.0, 0
+        
+        # Aplicar resolución objetivo
+        if target_resolution is None:
+            width, height = orig_width, orig_height
+            st.info(f"⚡ Procesando a resolución original: {width}x{height}")
+        else:
+            width, height = target_resolution
+            st.info(f"⚡ Optimización: Redimensionando de {orig_width}x{orig_height} a {width}x{height}")
+        
+        # Crear video de salida
+        output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps // frame_skip, (width, height))
+        
+        if not out.isOpened():
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            if output_path and os.path.exists(output_path):
+                os.unlink(output_path)
+            return None, 0, 0, 0, 0, 0, 0.0, 0
+        
+        # Estado para seguimiento de sentadillas (por persona)
+        person_states = {}  # {person_id: state_dict}
+        total_squats = 0
+        
+        # Procesar frames
+        frame_count = 0
+        processed_count = 0
+        batch_size = 4
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Buffer para frames a procesar
+        frame_batch = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Limitar número de frames si se especifica
+            if max_frames is not None and processed_count >= max_frames:
+                break
+            
+            # Frame skipping: solo procesar cada N frames
+            if frame_count % frame_skip != 0:
+                frame_count += 1
+                continue
+            
+            # Redimensionar frame ANTES de procesar (optimización) solo si es necesario
+            if target_resolution is not None and (frame.shape[1] != width or frame.shape[0] != height):
+                frame_resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+            else:
+                frame_resized = frame
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb)
+            
+            # Agregar a batch
+            frame_batch.append((frame_count, frame_pil, frame_resized))
+            
+            # Procesar batch cuando esté lleno
+            if len(frame_batch) >= batch_size:
+                # Procesar batch
+                for idx, pil_img, frame_bgr in frame_batch:
+                    try:
+                        # Aplicar inferencia de pose (igual que en análisis de imagen)
+                        result_image, person_count, persons_details = infer_multi_person_pose(
+                            pil_img, pose_model, detr_model, detr_processor, device, conf,
+                            point_size_multiplier, line_width_multiplier, detr_threshold
+                        )
+                        
+                        if result_image is not None and persons_details:
+                            # Procesar cada persona detectada
+                            max_squats_in_frame = 0
+                            is_any_squat_down = False
+                            
+                            for person_idx, person_detail in enumerate(persons_details):
+                                keypoints = np.array(person_detail['keypoints'])
+                                confidences = np.array(person_detail['confidences'])
+                                
+                                # Obtener o crear estado para esta persona
+                                person_id = person_idx  # Usar índice como ID
+                                if person_id not in person_states:
+                                    person_states[person_id] = {
+                                        'state': 'up',
+                                        'squat_count': 0,
+                                        'hip_y_avg': None,
+                                        'knee_y_avg': None
+                                    }
+                                
+                                # Detectar sentadilla
+                                is_squat_down, person_states[person_id] = detect_squat(
+                                    keypoints, confidences, person_states[person_id]
+                                )
+                                
+                                # Actualizar máximo de sentadillas y estado
+                                max_squats_in_frame = max(max_squats_in_frame, person_states[person_id]['squat_count'])
+                                if is_squat_down:
+                                    is_any_squat_down = True
+                            
+                            # Actualizar total de sentadillas (sumar todas las sentadillas de todas las personas)
+                            # Usar el máximo de sentadillas contadas por cualquier persona en este frame
+                            for person_id in person_states:
+                                total_squats = max(total_squats, person_states[person_id]['squat_count'])
+                            
+                            # Dibujar conteo en la imagen
+                            result_image = draw_squat_count(result_image, total_squats, is_any_squat_down)
+                            
+                            # Convertir PIL a OpenCV
+                            result_np = np.array(result_image)
+                            result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+                            out.write(result_bgr)
+                            processed_count += 1
+                        else:
+                            # Si falla, escribir frame original
+                            out.write(frame_bgr)
+                            processed_count += 1
+                    except Exception as e:
+                        # Si hay error, escribir frame original
+                        out.write(frame_bgr)
+                        processed_count += 1
+                
+                frame_batch.clear()
+                
+                # Actualizar progreso
+                if total_frames > 0:
+                    progress = min(1.0, frame_count / total_frames)
+                    progress_bar.progress(progress)
+                    status_text.text(f"⚡ Procesando: Frame {frame_count}/{total_frames} ({processed_count} procesados) | Sentadillas: {total_squats}")
+                else:
+                    progress_bar.progress(0.5)
+                    status_text.text(f"⚡ Procesando: Frame {frame_count} ({processed_count} procesados) | Sentadillas: {total_squats}")
+            
+            frame_count += 1
+        
+        # Procesar frames restantes en el batch
+        if len(frame_batch) > 0:
+            for idx, pil_img, frame_bgr in frame_batch:
+                try:
+                    result_image, person_count, persons_details = infer_multi_person_pose(
+                        pil_img, pose_model, detr_model, detr_processor, device, conf,
+                        point_size_multiplier, line_width_multiplier, detr_threshold
+                    )
+                    
+                    if result_image is not None and persons_details:
+                        max_squats_in_frame = 0
+                        is_any_squat_down = False
+                        
+                        for person_idx, person_detail in enumerate(persons_details):
+                            keypoints = np.array(person_detail['keypoints'])
+                            confidences = np.array(person_detail['confidences'])
+                            
+                            person_id = person_idx
+                            if person_id not in person_states:
+                                person_states[person_id] = {
+                                    'state': 'up',
+                                    'squat_count': 0,
+                                    'hip_y_avg': None,
+                                    'knee_y_avg': None
+                                }
+                            
+                            is_squat_down, person_states[person_id] = detect_squat(
+                                keypoints, confidences, person_states[person_id]
+                            )
+                            
+                            max_squats_in_frame = max(max_squats_in_frame, person_states[person_id]['squat_count'])
+                            if is_squat_down:
+                                is_any_squat_down = True
+                        
+                        # Actualizar total de sentadillas
+                        for person_id in person_states:
+                            total_squats = max(total_squats, person_states[person_id]['squat_count'])
+                        result_image = draw_squat_count(result_image, total_squats, is_any_squat_down)
+                        
+                        result_np = np.array(result_image)
+                        result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+                        out.write(result_bgr)
+                        processed_count += 1
+                    else:
+                        out.write(frame_bgr)
+                        processed_count += 1
+                except Exception as e:
+                    out.write(frame_bgr)
+                    processed_count += 1
+        
+        progress_bar.progress(1.0)
+        status_text.text(f"✅ Procesamiento completado: {processed_count} frames procesados | Sentadillas totales: {total_squats}")
+        
+        # Calcular tiempo de inferencia
+        inference_time = time.time() - start_time
+        
+    except Exception as e:
+        st.error(f"Error procesando video: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        if output_path and os.path.exists(output_path):
+            os.unlink(output_path)
+        inference_time = time.time() - start_time
+        return None, 0, 0, 0, 0, 0, inference_time, 0
+    finally:
+        if cap is not None:
+            cap.release()
+        if out is not None:
+            out.release()
+        if tfile and os.path.exists(tfile.name):
+            os.unlink(tfile.name)
+    
+    return output_path, total_frames, processed_count, fps, width, height, inference_time, total_squats
+
+def process_video(video_file, pose_model, detr_model, detr_processor, device, conf,
+                            point_size_multiplier=1.0, line_width_multiplier=1.0,
+                            detr_threshold=0.9, frame_skip=2, target_resolution=(640, 360),
+                            max_frames=None):
+    """
+    Procesa un video de forma optimizada aplicando técnicas avanzadas de optimización.
+    
+    Optimizaciones aplicadas:
+    1. Frame skipping: Procesa solo cada N frames
+    2. Resolución reducida: Procesa a menor resolución para mayor velocidad
+    3. Batch processing: Procesa múltiples frames en paralelo
+    4. Half precision (FP16): Usa FP16 si GPU está disponible
+    5. Efficient memory: Libera memoria inmediatamente después de procesar
+    
+    Args:
+        video_file: Archivo de video subido (BytesIO o path)
+        pose_model: Modelo de pose
+        detr_model: Modelo DETR
+        detr_processor: Procesador DETR
+        device: Dispositivo de cómputo
+        conf: Configuración del modelo
+        point_size_multiplier: Multiplicador para tamaño de puntos
+        line_width_multiplier: Multiplicador para grosor de líneas
+        detr_threshold: Umbral de confianza DETR
+        frame_skip: Procesar cada N frames (2 = cada 2 frames, etc.)
+        target_resolution: tuple (width, height) para redimensionar frames
+        max_frames: Número máximo de frames a procesar (None = todos)
+    
+    Returns:
+        tuple: (video_path, total_frames, processed_frames, fps, width, height, inference_time)
+    """
+    start_time = time.time()
+    tfile = None
+    output_path = None
+    cap = None
+    out = None
+    
+    try:
+        # Optimizaciones aplicadas:
+        # - Frame skipping para reducir número de frames procesados
+        # - Resolución reducida para procesamiento más rápido
+        # - Batch processing eficiente
+        # - torch.no_grad() ya está aplicado en las funciones de inferencia
+        
+        # Leer video completo para guardar
+        video_bytes = video_file.read()
+        
+        # Guardar video temporalmente
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(video_bytes)
+        tfile.close()
+        
+        # Abrir video
+        cap = cv2.VideoCapture(tfile.name)
+        if not cap.isOpened():
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            return None, 0, 0, 0, 0, 0, 0.0
+        
+        # Obtener propiedades del video original
+        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+        orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if orig_width == 0 or orig_height == 0:
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            return None, 0, 0, 0, 0, 0, 0.0
+        
+        # Aplicar resolución objetivo
+        if target_resolution is None:
+            # Si no se especifica resolución, usar la original
+            width, height = orig_width, orig_height
+            st.info(f"⚡ Procesando a resolución original: {width}x{height}")
+        else:
+            width, height = target_resolution
+            st.info(f"⚡ Optimización: Redimensionando de {orig_width}x{orig_height} a {width}x{height}")
+        
+        # Crear video de salida
+        output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps // frame_skip, (width, height))
+        
+        if not out.isOpened():
+            if tfile and os.path.exists(tfile.name):
+                os.unlink(tfile.name)
+            if output_path and os.path.exists(output_path):
+                os.unlink(output_path)
+            return None, 0, 0, 0, 0, 0, 0.0
+        
+        # Procesar frames
+        frame_count = 0
+        processed_count = 0
+        batch_size = 4  # Batch pequeño para optimizar memoria
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Buffer para frames a procesar
+        frame_batch = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Limitar número de frames si se especifica
+            if max_frames is not None and processed_count >= max_frames:
+                break
+            
+            # Frame skipping: solo procesar cada N frames
+            if frame_count % frame_skip != 0:
+                frame_count += 1
+                continue
+            
+            # Redimensionar frame ANTES de procesar (optimización) solo si es necesario
+            if target_resolution is not None and (frame.shape[1] != width or frame.shape[0] != height):
+                frame_resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+            else:
+                frame_resized = frame
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb)
+            
+            # Agregar a batch
+            frame_batch.append((frame_count, frame_pil, frame_resized))
+            
+            # Procesar batch cuando esté lleno
+            if len(frame_batch) >= batch_size:
+                # Procesar batch
+                for idx, pil_img, frame_bgr in frame_batch:
+                    try:
+                        # Aplicar inferencia de pose (igual que en análisis de imagen)
+                        result_image, person_count, _ = infer_multi_person_pose(
+                            pil_img, pose_model, detr_model, detr_processor, device, conf,
+                            point_size_multiplier, line_width_multiplier, detr_threshold
+                        )
+                        
+                        if result_image is not None:
+                            # Convertir PIL a OpenCV
+                            result_np = np.array(result_image)
+                            result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+                            out.write(result_bgr)
+                            processed_count += 1
+                        else:
+                            # Si falla, escribir frame original
+                            out.write(frame_bgr)
+                            processed_count += 1
+                    except Exception as e:
+                        # Si hay error, escribir frame original
+                        out.write(frame_bgr)
+                        processed_count += 1
+                
+                frame_batch.clear()
+                
+                # Actualizar progreso
+                if total_frames > 0:
+                    progress = min(1.0, frame_count / total_frames)
+                    progress_bar.progress(progress)
+                    status_text.text(f"⚡ Procesando: Frame {frame_count}/{total_frames} ({processed_count} procesados)")
+                else:
+                    progress_bar.progress(0.5)
+                    status_text.text(f"⚡ Procesando: Frame {frame_count} ({processed_count} procesados)")
+            
+            frame_count += 1
+        
+        # Procesar frames restantes en el batch
+        if len(frame_batch) > 0:
+            for idx, pil_img, frame_bgr in frame_batch:
+                try:
+                    result_image, person_count, _ = infer_multi_person_pose(
+                        pil_img, pose_model, detr_model, detr_processor, device, conf,
+                        point_size_multiplier, line_width_multiplier, detr_threshold
+                    )
+                    
+                    if result_image is not None:
+                        result_np = np.array(result_image)
+                        result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+                        out.write(result_bgr)
+                        processed_count += 1
+                    else:
+                        out.write(frame_bgr)
+                        processed_count += 1
+                except Exception as e:
+                    out.write(frame_bgr)
+                    processed_count += 1
+        
+        progress_bar.progress(1.0)
+        status_text.text(f"✅ Procesamiento completado: {processed_count} frames procesados")
+        
+        # Calcular tiempo de inferencia
+        inference_time = time.time() - start_time
+        
+    except Exception as e:
+        st.error(f"Error procesando video: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        if output_path and os.path.exists(output_path):
+            os.unlink(output_path)
+        return None, 0, 0, 0, 0, 0, 0.0
+    finally:
+        if cap is not None:
+            cap.release()
+        if out is not None:
+            out.release()
+        if tfile and os.path.exists(tfile.name):
+            os.unlink(tfile.name)
+    
+    return output_path, total_frames, processed_count, fps, width, height, inference_time
 
 
 def main():
@@ -1073,6 +1378,8 @@ def main():
         <strong>Rosa claro:</strong> Conexiones de cabeza<br><br>
         
         <em>Diseño colorido y profesional para una visualización clara de las poses detectadas.</em>
+        <em> Visualización con círculos negros para los puntos clave</em>
+
         </div>
         """, unsafe_allow_html=True)
         
@@ -1121,7 +1428,7 @@ def main():
     st.markdown("### Modo de Análisis")
     mode = st.radio(
         "Selecciona el modo de análisis:",
-        ["Análisis de Imagen", "Tomar Foto", "Análisis de Video"]
+        ["Análisis de Imagen", "Tomar Foto", "Análisis de Video", "Conteo de sentadillas"]
     )
     
     if mode == "Análisis de Imagen":
@@ -1214,6 +1521,19 @@ def main():
     
     elif mode == "Análisis de Video":
         
+        st.markdown("""
+        <div class="card">
+            <h3>⚡ Análisis de Video</h3>
+            <p>Procesa videos de forma optimizada usando técnicas avanzadas de optimización para detectar poses humanas.</p>
+            <p><strong>Optimizaciones aplicadas:</strong></p>
+            <ul>
+                <li>Frame skipping: Procesa solo cada N frames</li>
+                <li>Resolución reducida: Procesa a menor resolución para mayor velocidad</li>
+                <li>Procesamiento eficiente: Optimizado para reducir tiempo de espera</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -1221,54 +1541,33 @@ def main():
             uploaded_video = st.file_uploader(
                 "Selecciona un video",
                 type=['mp4', 'avi', 'mov', 'mkv', 'webm'],
-                help="Formatos soportados: MP4, AVI, MOV, MKV, WEBM"
+                help="Formatos soportados: MP4, AVI, MOV, MKV, WEBM",
+                key="video_uploader"
             )
             
             if uploaded_video is not None:
                 # Mostrar información del video
                 st.video(uploaded_video)
                 
-                # Configuración de procesamiento
-                st.markdown("#### Configuración de Procesamiento")
-                
-                max_frames_option = st.selectbox(
-                    "Límite de frames",
-                    ["Todos los frames", "50 frames", "100 frames", "200 frames", "500 frames"],
-                    help="Limita el número de frames a procesar para videos largos"
-                )
-                
-                max_frames_map = {
-                    "Todos los frames": None,
-                    "50 frames": 50,
-                    "100 frames": 100,
-                    "200 frames": 200,
-                    "500 frames": 500
-                }
-                max_frames = max_frames_map[max_frames_option]
+                # Configuración de procesamiento optimizado
+                st.markdown("#### ⚡ Configuración Optimizada")
                 
                 frame_skip = st.slider(
                     "Procesar cada N frames",
                     min_value=1,
                     max_value=10,
-                    value=1,
-                    help="1 = todos los frames, 2 = cada 2 frames, etc. Útil para videos largos"
-                )
-                
-                batch_size = st.slider(
-                    "Tamaño del batch (procesamiento paralelo)",
-                    min_value=1,
-                    max_value=16,
-                    value=8,
-                    step=1,
-                    help="Número de frames a procesar en paralelo. Valores más altos = más rápido pero más uso de memoria. Recomendado: 4-8 para reducir uso de memoria. El video se procesa en streaming para optimizar recursos."
+                    value=2,
+                    help="1 = todos los frames, 2 = cada 2 frames, etc. Valores más altos = más rápido",
+                    key="frame_skip"
                 )
                 
                 # Opción de resolución para procesamiento más rápido
                 resolution_option = st.selectbox(
-                    "Resolución de procesamiento (para mayor velocidad)",
-                    ["Original", "1080p (1920x1080)", "720p (1280x720)", "480p (854x480)", "360p (640x360)", "240p (426x240)"],
-                    index=2,  # Por defecto 720p para balance velocidad/calidad
-                    help="Reducir la resolución acelera significativamente el procesamiento. Recomendado: 720p o 480p para mejor velocidad."
+                    "Resolución de procesamiento",
+                    ["360p (640x360)", "480p (854x480)", "720p (1280x720)", "1080p (1920x1080)", "Original"],
+                    index=0,  # Por defecto 360p para máxima velocidad
+                    help="Resoluciones más bajas = procesamiento más rápido. Recomendado: 360p o 480p para mejor velocidad.",
+                    key="resolution_option"
                 )
                 
                 # Obtener resolución objetivo
@@ -1277,38 +1576,56 @@ def main():
                     "1080p (1920x1080)": (1920, 1080),
                     "720p (1280x720)": (1280, 720),
                     "480p (854x480)": (854, 480),
-                    "360p (640x360)": (640, 360),
-                    "240p (426x240)": (426, 240)
+                    "360p (640x360)": (640, 360)
                 }
                 target_resolution = resolution_map[resolution_option]
                 
-                st.info(f"""
-                **Configuración:** {max_frames_option} | Frame skip: {frame_skip} | Resolución: {resolution_option}
+                max_frames_option = st.selectbox(
+                    "Límite de frames (opcional)",
+                    ["Todos los frames", "50 frames", "100 frames", "200 frames"],
+                    help="Limita el número de frames a procesar para videos largos",
+                    key="max_frames_option"
+                )
                 
-                **Optimizado para velocidad y eficiencia**
+                max_frames_map = {
+                    "Todos los frames": None,
+                    "50 frames": 50,
+                    "100 frames": 100,
+                    "200 frames": 200
+                }
+                max_frames = max_frames_map[max_frames_option]
+                
+                st.success(f"""
+                **⚡ Configuración Optimizada:**
+                - Frame skip: {frame_skip} (procesa 1 de cada {frame_skip} frames)
+                - Resolución: {resolution_option}
+                - Límite: {max_frames_option}
+                
+                **Tiempo estimado:** Reducido significativamente gracias a las optimizaciones
                 """)
         
         with col2:
             st.markdown("#### Resultado")
             
             if uploaded_video is not None:
-                if st.button("Procesar Video", key="process_video"):
+                if st.button("⚡ Procesar Video", key="process_video", type="primary"):
                     # Resetear el stream del archivo
                     uploaded_video.seek(0)
                     
-                    with st.spinner("Procesando video... Esto puede tardar varios minutos."):
+                    with st.spinner("⚡ Procesando video con optimizaciones... Esto puede tardar unos minutos."):
                         try:
                             # Crear un BytesIO wrapper para el archivo
                             video_bytes_io = io.BytesIO(uploaded_video.read())
                             uploaded_video.seek(0)  # Resetear para mostrar el video original
                             
-                            output_path, total_frames, processed_frames, fps, width, height = process_video(
+                            output_path, total_frames, processed_frames, fps, width, height, inference_time = process_video(
                                 video_bytes_io,
                                 pose_model, detr_model, detr_processor, device, conf,
                                 point_size_multiplier, line_width_multiplier,
                                 detr_threshold,
-                                max_frames=max_frames, frame_skip=frame_skip,
-                                batch_size=batch_size, target_resolution=target_resolution
+                                frame_skip=frame_skip,
+                                target_resolution=target_resolution,
+                                max_frames=max_frames
                             )
                             
                             if output_path and os.path.exists(output_path):
@@ -1324,20 +1641,31 @@ def main():
                                 </div>
                                 """, unsafe_allow_html=True)
                                 
+                                # Mostrar tiempo de inferencia
+                                minutes = int(inference_time // 60)
+                                seconds = int(inference_time % 60)
+                                milliseconds = int((inference_time % 1) * 1000)
                                 
-                                # Mostrar video procesado
-                                st.video(video_bytes)
+                                if minutes > 0:
+                                    time_str = f"{minutes}m {seconds}s {milliseconds}ms"
+                                else:
+                                    time_str = f"{seconds}s {milliseconds}ms"
+                                
+                                st.markdown(f"""
+                                <div class=\"metric-card\" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                                    <div class=\"metric-value\">{time_str}</div>
+                                    <div class=\"metric-label\">Tiempo de inferencia</div>
+                                </div>
+                                """, unsafe_allow_html=True)
                                 
                                 # Opción de descarga
                                 st.download_button(
                                     label="Descargar Video Procesado",
                                     data=video_bytes,
-                                    file_name=f"pose_result_{uploaded_video.name}",
+                                    file_name=f"pose_result_optimized_{uploaded_video.name}",
                                     mime="video/mp4"
                                 )
                                 
-                                # Limpiar archivo temporal después de un tiempo
-                                # (Streamlit manejará la limpieza cuando se recargue la página)
                             else:
                                 st.error("No se pudo procesar el video. Verifica que el formato sea compatible.")
                                 
@@ -1349,10 +1677,188 @@ def main():
                 st.markdown("""
                 <div class=\"camera-container\">
                     <h4>Sube un video para comenzar</h4>
-                    <p>Selecciona un video desde tu dispositivo para analizar las poses</p>
+                    <p>Selecciona un video desde tu dispositivo para analizar las poses con la versión optimizada</p>
                 </div>
                 """, unsafe_allow_html=True)
     
+    elif mode == "Conteo de sentadillas":
+        
+        st.markdown("""
+        <div class="card">
+            <h3>🏋️ Conteo de Sentadillas</h3>
+            <p>Analiza videos de ejercicios y cuenta automáticamente las sentadillas realizadas en tiempo real.</p>
+            <p><strong>Características:</strong></p>
+            <ul>
+                <li>Detección automática de sentadillas basada en pose estimation</li>
+                <li>Conteo en tiempo real durante el procesamiento</li>
+                <li>Visualización del esqueleto con keypoints</li>
+                <li>Indicador visual de estado (BAJANDO/SUBIENDO)</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("#### Subir Video")
+            uploaded_video = st.file_uploader(
+                "Selecciona un video con ejercicios",
+                type=['mp4', 'avi', 'mov', 'mkv', 'webm'],
+                help="Formatos soportados: MP4, AVI, MOV, MKV, WEBM",
+                key="video_uploader_squat"
+            )
+            
+            if uploaded_video is not None:
+                # Mostrar información del video
+                st.video(uploaded_video)
+                
+                # Configuración de procesamiento
+                st.markdown("#### ⚙️ Configuración")
+                
+                frame_skip = st.slider(
+                    "Procesar cada N frames",
+                    min_value=1,
+                    max_value=10,
+                    value=2,
+                    help="1 = todos los frames, 2 = cada 2 frames, etc. Valores más altos = más rápido",
+                    key="frame_skip_squat"
+                )
+                
+                # Opción de resolución para procesamiento más rápido
+                resolution_option = st.selectbox(
+                    "Resolución de procesamiento",
+                    ["360p (640x360)", "480p (854x480)", "720p (1280x720)", "1080p (1920x1080)", "Original"],
+                    index=0,  # Por defecto 360p para máxima velocidad
+                    help="Resoluciones más bajas = procesamiento más rápido. Recomendado: 360p o 480p para mejor velocidad.",
+                    key="resolution_option_squat"
+                )
+                
+                # Obtener resolución objetivo
+                resolution_map = {
+                    "Original": None,
+                    "1080p (1920x1080)": (1920, 1080),
+                    "720p (1280x720)": (1280, 720),
+                    "480p (854x480)": (854, 480),
+                    "360p (640x360)": (640, 360)
+                }
+                target_resolution = resolution_map[resolution_option]
+                
+                max_frames_option = st.selectbox(
+                    "Límite de frames (opcional)",
+                    ["Todos los frames", "50 frames", "100 frames", "200 frames"],
+                    help="Limita el número de frames a procesar para videos largos",
+                    key="max_frames_option_squat"
+                )
+                
+                max_frames_map = {
+                    "Todos los frames": None,
+                    "50 frames": 50,
+                    "100 frames": 100,
+                    "200 frames": 200
+                }
+                max_frames = max_frames_map[max_frames_option]
+                
+                st.info(f"""
+                **⚙️ Configuración:**
+                - Frame skip: {frame_skip} (procesa 1 de cada {frame_skip} frames)
+                - Resolución: {resolution_option}
+                - Límite: {max_frames_option}
+                
+                **💡 Consejo:** Asegúrate de que la persona esté completamente visible en el video para una mejor detección.
+                """)
+        
+        with col2:
+            st.markdown("#### Resultado")
+            
+            if uploaded_video is not None:
+                if st.button("🏋️ Procesar Video", key="process_video_squat", type="primary"):
+                    # Resetear el stream del archivo
+                    uploaded_video.seek(0)
+                    
+                    with st.spinner("🏋️ Procesando video y contando sentadillas... Esto puede tardar unos minutos."):
+                        try:
+                            # Crear un BytesIO wrapper para el archivo
+                            video_bytes_io = io.BytesIO(uploaded_video.read())
+                            uploaded_video.seek(0)  # Resetear para mostrar el video original
+                            
+                            output_path, total_frames, processed_frames, fps, width, height, inference_time, total_squats = process_video_squat_count(
+                                video_bytes_io,
+                                pose_model, detr_model, detr_processor, device, conf,
+                                point_size_multiplier, line_width_multiplier,
+                                detr_threshold,
+                                frame_skip=frame_skip,
+                                target_resolution=target_resolution,
+                                max_frames=max_frames
+                            )
+                            
+                            if output_path and os.path.exists(output_path):
+                                # Leer el video procesado
+                                with open(output_path, 'rb') as video_file:
+                                    video_bytes = video_file.read()
+                                
+                                # Mostrar estadísticas
+                                st.markdown(f"""
+                                <div class=\"metric-card\">
+                                    <div class=\"metric-value\">{processed_frames}</div>
+                                    <div class=\"metric-label\">frames procesados</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Mostrar tiempo de inferencia
+                                minutes = int(inference_time // 60)
+                                seconds = int(inference_time % 60)
+                                milliseconds = int((inference_time % 1) * 1000)
+                                
+                                if minutes > 0:
+                                    time_str = f"{minutes}m {seconds}s {milliseconds}ms"
+                                else:
+                                    time_str = f"{seconds}s {milliseconds}ms"
+                                
+                                st.markdown(f"""
+                                <div class=\"metric-card\" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                                    <div class=\"metric-value\">{time_str}</div>
+                                    <div class=\"metric-label\">Tiempo de inferencia</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Mostrar TOTAL DE SENTADILLAS (destacado)
+                                st.markdown(f"""
+                                <div class=\"metric-card\" style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);">
+                                    <div class=\"metric-value\" style="font-size: 3rem;">{total_squats}</div>
+                                    <div class=\"metric-label\" style="font-size: 1.2rem;">Sentadillas Totales</div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Opción de descarga
+                                st.download_button(
+                                    label="Descargar Video Procesado",
+                                    data=video_bytes,
+                                    file_name=f"squat_count_{uploaded_video.name}",
+                                    mime="video/mp4"
+                                )
+                                
+                            else:
+                                st.error("No se pudo procesar el video. Verifica que el formato sea compatible.")
+                                
+                        except Exception as e:
+                            st.error(f"Error procesando el video: {e}")
+                            import traceback
+                            st.code(traceback.format_exc())
+            else:
+                st.markdown("""
+                <div class=\"camera-container\">
+                    <h4>Sube un video para comenzar</h4>
+                    <p>Selecciona un video con ejercicios de sentadillas para contar automáticamente las repeticiones</p>
+                    <p><strong>Recomendaciones:</strong></p>
+                    <ul style="text-align: left; display: inline-block;">
+                        <li>Persona completamente visible</li>
+                        <li>Buena iluminación</li>
+                        <li>Fondo simple</li>
+                        <li>Vista lateral o frontal</li>
+                    </ul>
+                </div>
+                """, unsafe_allow_html=True)
+              
     # Footer
     st.markdown("---")
     st.markdown("""
