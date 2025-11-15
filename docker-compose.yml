@@ -1,7 +1,9 @@
 services:
   pose-prediction:
-    build: .
+    build: 
+      context: .
     container_name: prtr-pose-prediction
+    platform: linux/arm64
     ports:
       - "8501:8501"
     volumes:
@@ -12,15 +14,8 @@ services:
       - ./app.py:/app/app.py
       - ./start_app.py:/app/start_app.py
     environment:
-      - CUDA_VISIBLE_DEVICES=0
       - PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - PYTORCH_ENABLE_MPS_FALLBACK=1
     command: ["python", "start_app.py"]
     stdin_open: true
     tty: true

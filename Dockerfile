@@ -1,7 +1,7 @@
 # ===========================================
-# BASE IMAGE: PyTorch con CUDA (devel para compilar extensiones)
+# BASE IMAGE: Python para ARM64 (compatible con Apple Silicon)
 # ===========================================
-FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-devel
+FROM python:3.10-slim
 
 # Evitar prompts interactivos y mejorar pip performance
 ENV DEBIAN_FRONTEND=noninteractive
@@ -14,6 +14,20 @@ ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 # Crear y establecer directorio de trabajo
 WORKDIR /app
 
+# ===========================================
+# DEPENDENCIAS DEL SISTEMA
+# ===========================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    g++ \
+    make \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 # ===========================================
 # DEPENDENCIAS PYTHON
@@ -24,7 +38,7 @@ COPY requirements.txt /app/requirements.txt
 # Actualizar pip y herramientas básicas
 RUN pip install --upgrade pip setuptools wheel
 
-# Instalar dependencias
+# Instalar dependencias (PyTorch se instalará desde requirements.txt con soporte para ARM64)
 RUN pip install --no-cache-dir --prefer-binary -r /app/requirements.txt
 
 # ===========================================

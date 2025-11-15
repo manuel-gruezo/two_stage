@@ -159,6 +159,26 @@ st.markdown("""
         margin: 0.5rem 0;
         border-left: 3px solid #667eea;
     }
+    
+    .instructions-card {
+        background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        margin-bottom: 1rem;
+        border-left: 4px solid #2196f3;
+        color: #333333;
+    }
+    
+    .recommendations-card {
+        background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        margin-bottom: 1rem;
+        border-left: 4px solid #ff9800;
+        color: #333333;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -696,9 +716,58 @@ def show_result_with_download(result_image, person_count, file_name_prefix, file
         mime=f"image/{file_extension}"
     )
 
+def show_images_side_by_side(original_image, result_image, original_caption="Imagen Original", result_caption="Pose Detection Result"):
+    """Muestra dos imágenes lado a lado con el mismo tamaño para alineación perfecta"""
+    # Obtener dimensiones de ambas imágenes
+    orig_w, orig_h = original_image.size
+    result_w, result_h = result_image.size
+    
+    # Calcular el tamaño común manteniendo la relación de aspecto
+    # Usar el máximo de ambos para asegurar que ambas quepan
+    max_width = max(orig_w, result_w)
+    max_height = max(orig_h, result_h)
+    
+    # Redimensionar ambas imágenes al mismo tamaño manteniendo relación de aspecto
+    # Usar el tamaño más grande para que ambas tengan el mismo tamaño de visualización
+    target_size = (max_width, max_height)
+    
+    # Redimensionar manteniendo relación de aspecto y centrando
+    def resize_with_padding(img, target_size):
+        """Redimensiona una imagen manteniendo relación de aspecto y añadiendo padding"""
+        img_w, img_h = img.size
+        target_w, target_h = target_size
+        
+        # Calcular escala para que quepa en el tamaño objetivo
+        scale = min(target_w / img_w, target_h / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        
+        # Redimensionar
+        img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        # Crear imagen nueva con fondo blanco
+        img_padded = Image.new('RGB', target_size, (255, 255, 255))
+        
+        # Centrar la imagen redimensionada
+        x_offset = (target_w - new_w) // 2
+        y_offset = (target_h - new_h) // 2
+        img_padded.paste(img_resized, (x_offset, y_offset))
+        
+        return img_padded
+    
+    original_resized = resize_with_padding(original_image, target_size)
+    result_resized = resize_with_padding(result_image, target_size)
+    
+    # Mostrar lado a lado con columnas iguales
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(original_resized, caption=original_caption, use_container_width=True)
+    with col2:
+        st.image(result_resized, caption=result_caption, use_container_width=True)
+
 def process_and_show_pose(image, pose_model, detr_model, detr_processor, device, conf,
                           point_size_multiplier, line_width_multiplier, detr_threshold,
-                          file_name_prefix, processing_message="Procesando..."):
+                          file_name_prefix, processing_message="Procesando...", show_side_by_side=True):
     """Procesa una imagen y muestra el resultado"""
     start_time = time.time()
     with st.spinner(processing_message):
@@ -711,7 +780,49 @@ def process_and_show_pose(image, pose_model, detr_model, detr_processor, device,
         inference_time = time.time() - start_time
         
         if result_image is not None:
-            show_result_with_download(result_image, person_count, file_name_prefix, inference_time=inference_time)
+            if show_side_by_side:
+                # Mostrar ambas imágenes lado a lado
+                show_images_side_by_side(image, result_image, "Imagen Original", "Pose Detection Result")
+            else:
+                show_result_with_download(result_image, person_count, file_name_prefix, inference_time=inference_time)
+            
+            # Estadísticas
+            st.markdown(f"""
+            <div class=\"metric-card\">
+                <div class=\"metric-value\">{person_count}</div>
+                <div class=\"metric-label\">personas detectadas</div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Mostrar tiempo de inferencia
+            if inference_time is not None:
+                minutes = int(inference_time // 60)
+                seconds = int(inference_time % 60)
+                milliseconds = int((inference_time % 1) * 1000)
+                
+                if minutes > 0:
+                    time_str = f"{minutes}m {seconds}s {milliseconds}ms"
+                else:
+                    time_str = f"{seconds}s {milliseconds}ms"
+                
+                st.markdown(f"""
+                <div class=\"metric-card\" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                    <div class=\"metric-value\">{time_str}</div>
+                    <div class=\"metric-label\">Tiempo de inferencia</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Opción de descarga
+            buf = io.BytesIO()
+            result_image.save(buf, format="PNG")
+            byte_im = buf.getvalue()
+            
+            st.download_button(
+                label="Descargar Resultado",
+                data=byte_im,
+                file_name=f"pose_result_{file_name_prefix}.png",
+                mime="image/png"
+            )
         else:
             st.error("No se pudo procesar la imagen")
         return result_image, person_count, persons_details
@@ -790,34 +901,100 @@ def detect_squat(keypoints, confidences, prev_state=None):
     
     return is_squat_down, state
 
-def draw_squat_count(img_pil, squat_count, is_squat_down):
+def track_persons(current_bboxes, previous_centroids, max_distance=100):
+    """
+    Asigna IDs estables a personas basándose en la distancia entre centroides de bboxes.
+    
+    Args:
+        current_bboxes: Lista de bboxes actuales [[x_min, y_min, x_max, y_max], ...]
+        previous_centroids: Dict {person_id: [center_x, center_y]} con centroides anteriores
+        max_distance: Distancia máxima para considerar que es la misma persona
+    
+    Returns:
+        tuple: (person_assignments, updated_centroids) donde:
+            person_assignments: Dict {bbox_idx: person_id} mapea índices de bboxes a IDs de persona
+            updated_centroids: Dict {person_id: [center_x, center_y]} con centroides actualizados
+    """
+    if not current_bboxes:
+        return {}, {}
+    
+    # Calcular centroides actuales
+    current_centroids = []
+    for bbox in current_bboxes:
+        x_min, y_min, x_max, y_max = bbox
+        center_x = (x_min + x_max) / 2.0
+        center_y = (y_min + y_max) / 2.0
+        current_centroids.append([center_x, center_y])
+    
+    # Si no hay personas anteriores, asignar IDs nuevos
+    if not previous_centroids:
+        assignments = {idx: idx for idx in range(len(current_bboxes))}
+        updated_centroids = {idx: current_centroids[idx] for idx in range(len(current_bboxes))}
+        return assignments, updated_centroids
+    
+    # Asignar IDs basándose en distancia mínima
+    assignments = {}
+    used_person_ids = set()
+    updated_centroids = {}
+    
+    # Para cada bbox actual, encontrar la persona anterior más cercana
+    for bbox_idx, current_centroid in enumerate(current_centroids):
+        min_distance = float('inf')
+        best_person_id = None
+        
+        for person_id, prev_centroid in previous_centroids.items():
+            if person_id in used_person_ids:
+                continue
+            
+            distance = np.sqrt(
+                (current_centroid[0] - prev_centroid[0])**2 + 
+                (current_centroid[1] - prev_centroid[1])**2
+            )
+            
+            if distance < min_distance and distance < max_distance:
+                min_distance = distance
+                best_person_id = person_id
+        
+        # Si encontramos una persona cercana, usar su ID; si no, crear uno nuevo
+        if best_person_id is not None:
+            assignments[bbox_idx] = best_person_id
+            used_person_ids.add(best_person_id)
+            updated_centroids[best_person_id] = current_centroid
+        else:
+            # Crear nuevo ID (usar el siguiente número disponible)
+            new_id = max(previous_centroids.keys(), default=-1) + 1
+            while new_id in used_person_ids or new_id in updated_centroids:
+                new_id += 1
+            assignments[bbox_idx] = new_id
+            updated_centroids[new_id] = current_centroid
+    
+    return assignments, updated_centroids
+
+def draw_squat_count(img_pil, squat_count, is_squat_down, persons_data=None):
     """
     Dibuja el conteo de sentadillas en la imagen.
+    Si persons_data está presente y tiene más de una persona, dibuja un cuadro por persona.
+    Si solo hay una persona o persons_data es None, mantiene el comportamiento original.
     
     Args:
         img_pil: Imagen PIL donde dibujar
-        squat_count: Número de sentadillas contadas
-        is_squat_down: Si está en posición baja
+        squat_count: Número de sentadillas contadas (usado solo si persons_data es None)
+        is_squat_down: Si está en posición baja (usado solo si persons_data es None)
+        persons_data: Lista de dicts con info de cada persona: {'person_id', 'squat_count', 'is_squat_down', 'bbox'}
     
     Returns:
         PIL.Image: Imagen con el conteo dibujado
     """
     draw = ImageDraw.Draw(img_pil)
     
-    # Texto del conteo
-    text = f"Sentadillas: {squat_count}"
-    status_text = "BAJANDO" if is_squat_down else "SUBIENDO"
-    
     # Obtener dimensiones de la imagen
     width, height = img_pil.size
     
-    # Fuente grande para el conteo
+    # Fuente para el conteo
     font = None
     try:
         from PIL import ImageFont
-        # Intentar usar una fuente más grande
-        font_size = max(40, int(width / 20))
-        # Intentar diferentes fuentes comunes
+        font_size = max(30, int(width / 25))
         font_paths = [
             "arial.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -833,48 +1010,153 @@ def draw_squat_count(img_pil, squat_count, is_squat_down):
     except:
         pass
     
-    # Fondo semi-transparente para el texto
-    text_bbox = draw.textbbox((0, 0), text, font=font) if font else draw.textbbox((0, 0), text)
-    text_width = text_bbox[2] - text_bbox[0]
-    text_height = text_bbox[3] - text_bbox[1]
-    
-    status_bbox = draw.textbbox((0, 0), status_text, font=font) if font else draw.textbbox((0, 0), status_text)
-    status_width = status_bbox[2] - status_bbox[0]
-    status_height = status_bbox[3] - status_bbox[1]
-    
-    # Dibujar fondo
-    padding = 20
-    box_x = 20
-    box_y = 20
-    box_width = max(text_width, status_width) + padding * 2
-    box_height = text_height + status_height + padding * 3
-    
-    # Fondo semi-transparente (usar gris oscuro en lugar de transparencia)
-    draw.rectangle(
-        [(box_x, box_y), (box_x + box_width, box_y + box_height)],
-        fill=(40, 40, 40),  # Gris oscuro
-        outline=(255, 255, 255),
-        width=3
-    )
-    
-    # Color del texto según estado
-    text_color = (255, 100, 100) if is_squat_down else (100, 255, 100)
-    
-    # Dibujar texto del conteo
-    draw.text(
-        (box_x + padding, box_y + padding),
-        text,
-        fill=(255, 255, 255),
-        font=font
-    )
-    
-    # Dibujar texto del estado
-    draw.text(
-        (box_x + padding, box_y + padding + text_height + 10),
-        status_text,
-        fill=text_color,
-        font=font
-    )
+    # Si hay múltiples personas, dibujar un cuadro por persona
+    if persons_data and len(persons_data) > 1:
+        # Fuente más pequeña para múltiples personas
+        small_font = None
+        try:
+            from PIL import ImageFont
+            small_font_size = max(20, int(width / 35))
+            font_paths = [
+                "arial.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+                "C:/Windows/Fonts/arial.ttf"
+            ]
+            for font_path in font_paths:
+                try:
+                    small_font = ImageFont.truetype(font_path, small_font_size)
+                    break
+                except:
+                    continue
+        except:
+            pass
+        
+        num_persons = len(persons_data)
+        max_boxes_per_row = min(3, num_persons)
+        boxes_per_row = min(max_boxes_per_row, num_persons)
+        
+        # Ordenar por person_id para mantener posiciones fijas de los cuadros
+        persons_data_sorted = sorted(persons_data, key=lambda x: x.get('person_id', 0))
+        
+        # Posición inicial
+        start_x = 10
+        start_y = 10
+        box_spacing_x = 5
+        box_spacing_y = 5
+        
+        for idx, person_info in enumerate(persons_data_sorted):
+            person_id = person_info.get('person_id', idx)
+            person_squat_count = person_info.get('squat_count', 0)
+            person_is_squat_down = person_info.get('is_squat_down', False)
+            
+            # Texto del conteo
+            text = f"P{person_id+1}: {person_squat_count}"
+            status_text = "BAJANDO" if person_is_squat_down else "SUBIENDO"
+            
+            # Calcular tamaño exacto del texto
+            text_bbox = draw.textbbox((0, 0), text, font=small_font) if small_font else draw.textbbox((0, 0), text)
+            status_bbox = draw.textbbox((0, 0), status_text, font=small_font) if small_font else draw.textbbox((0, 0), status_text)
+            
+            text_width = max(text_bbox[2] - text_bbox[0], status_bbox[2] - status_bbox[0])
+            text_height_line = text_bbox[3] - text_bbox[1]
+            status_height = status_bbox[3] - status_bbox[1]
+            total_text_height = text_height_line + status_height
+            
+            # Tamaño del cuadro ajustado al contenido (mínimo padding)
+            padding = 4
+            box_width = text_width + padding * 2
+            box_height = total_text_height + padding * 2 + 2  # +2 para separación entre líneas
+            
+            # Calcular posición del cuadro
+            row = idx // boxes_per_row
+            col = idx % boxes_per_row
+            
+            # Calcular posición acumulada basada en el ancho máximo estimado
+            # Usar un ancho estimado para todos los cuadros (más simple y eficiente)
+            estimated_max_width = text_width + padding * 2
+            box_x = start_x + col * (estimated_max_width + box_spacing_x)
+            box_y = start_y + row * (box_height + box_spacing_y)
+            
+            # Asegurar que no se salga de la pantalla
+            if box_x + box_width > width:
+                box_x = width - box_width - 5
+            if box_y + box_height > height:
+                box_y = height - box_height - 5
+            
+            # Fondo del cuadro compacto
+            draw.rectangle(
+                [(box_x, box_y), (box_x + box_width, box_y + box_height)],
+                fill=(40, 40, 40),
+                outline=(255, 255, 255),
+                width=1
+            )
+            
+            # Color del texto según estado
+            text_color = (255, 100, 100) if person_is_squat_down else (100, 255, 100)
+            
+            # Dibujar texto del conteo
+            draw.text(
+                (box_x + padding, box_y + padding),
+                text,
+                fill=(255, 255, 255),
+                font=small_font
+            )
+            
+            # Dibujar texto del estado
+            draw.text(
+                (box_x + padding, box_y + padding + text_height_line + 2),
+                status_text,
+                fill=text_color,
+                font=small_font
+            )
+    else:
+        # Comportamiento original para una sola persona
+        text = f"Sentadillas: {squat_count}"
+        status_text = "BAJANDO" if is_squat_down else "SUBIENDO"
+        
+        # Fondo semi-transparente para el texto
+        text_bbox = draw.textbbox((0, 0), text, font=font) if font else draw.textbbox((0, 0), text)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        
+        status_bbox = draw.textbbox((0, 0), status_text, font=font) if font else draw.textbbox((0, 0), status_text)
+        status_width = status_bbox[2] - status_bbox[0]
+        status_height = status_bbox[3] - status_bbox[1]
+        
+        # Dibujar fondo
+        padding = 20
+        box_x = 20
+        box_y = 20
+        box_width = max(text_width, status_width) + padding * 2
+        box_height = text_height + status_height + padding * 3
+        
+        # Fondo semi-transparente (usar gris oscuro en lugar de transparencia)
+        draw.rectangle(
+            [(box_x, box_y), (box_x + box_width, box_y + box_height)],
+            fill=(40, 40, 40),  # Gris oscuro
+            outline=(255, 255, 255),
+            width=3
+        )
+        
+        # Color del texto según estado
+        text_color = (255, 100, 100) if is_squat_down else (100, 255, 100)
+        
+        # Dibujar texto del conteo
+        draw.text(
+            (box_x + padding, box_y + padding),
+            text,
+            fill=(255, 255, 255),
+            font=font
+        )
+        
+        # Dibujar texto del estado
+        draw.text(
+            (box_x + padding, box_y + padding + text_height + 10),
+            status_text,
+            fill=text_color,
+            font=font
+        )
     
     return img_pil
 
@@ -900,7 +1182,8 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
         max_frames: Número máximo de frames a procesar (None = todos)
     
     Returns:
-        tuple: (video_path, total_frames, processed_frames, fps, width, height, inference_time, total_squats)
+        tuple: (video_path, total_frames, processed_frames, fps, width, height, inference_time, total_squats, person_squats)
+        donde person_squats es un dict {person_id: squat_count}
     """
     start_time = time.time()
     tfile = None
@@ -938,10 +1221,10 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
         # Aplicar resolución objetivo
         if target_resolution is None:
             width, height = orig_width, orig_height
-            st.info(f"⚡ Procesando a resolución original: {width}x{height}")
+            st.info(f"Procesando a resolución original: {width}x{height}")
         else:
             width, height = target_resolution
-            st.info(f"⚡ Optimización: Redimensionando de {orig_width}x{orig_height} a {width}x{height}")
+            st.info(f"Optimización: Redimensionando de {orig_width}x{orig_height} a {width}x{height}")
         
         # Crear video de salida
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
@@ -957,6 +1240,7 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
         
         # Estado para seguimiento de sentadillas (por persona)
         person_states = {}  # {person_id: state_dict}
+        person_centroids = {}  # {person_id: [center_x, center_y]} para tracking
         total_squats = 0
         
         # Procesar frames
@@ -1007,16 +1291,26 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
                         )
                         
                         if result_image is not None and persons_details:
+                            # Obtener bboxes para tracking
+                            current_bboxes = [person_detail['bbox'] for person_detail in persons_details]
+                            
+                            # Hacer tracking de personas
+                            person_assignments, person_centroids = track_persons(
+                                current_bboxes, person_centroids, max_distance=150
+                            )
+                            
                             # Procesar cada persona detectada
-                            max_squats_in_frame = 0
+                            persons_data_list = []
                             is_any_squat_down = False
                             
                             for person_idx, person_detail in enumerate(persons_details):
                                 keypoints = np.array(person_detail['keypoints'])
                                 confidences = np.array(person_detail['confidences'])
                                 
-                                # Obtener o crear estado para esta persona
-                                person_id = person_idx  # Usar índice como ID
+                                # Obtener ID de persona usando tracking
+                                person_id = person_assignments.get(person_idx, person_idx)
+                                
+                                # Crear o actualizar estado para esta persona
                                 if person_id not in person_states:
                                     person_states[person_id] = {
                                         'state': 'up',
@@ -1030,18 +1324,96 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
                                     keypoints, confidences, person_states[person_id]
                                 )
                                 
-                                # Actualizar máximo de sentadillas y estado
-                                max_squats_in_frame = max(max_squats_in_frame, person_states[person_id]['squat_count'])
+                                # Agregar información de esta persona para dibujar
+                                persons_data_list.append({
+                                    'person_id': person_id,
+                                    'squat_count': person_states[person_id]['squat_count'],
+                                    'is_squat_down': is_squat_down,
+                                    'bbox': person_detail['bbox']
+                                })
+                                
                                 if is_squat_down:
                                     is_any_squat_down = True
                             
+                            # Dibujar ID de persona sobre cada persona en el video
+                            draw = ImageDraw.Draw(result_image)
+                            for person_idx, person_detail in enumerate(persons_details):
+                                person_id = person_assignments.get(person_idx, person_idx)
+                                bbox = person_detail['bbox']
+                                x_min, y_min, x_max, y_max = bbox
+                                keypoints = np.array(person_detail['keypoints'])
+                                confidences = np.array(person_detail['confidences'])
+                                
+                                # Texto del ID
+                                person_label = f"P{person_id+1}"
+                                
+                                # Fuente para el ID
+                                try:
+                                    from PIL import ImageFont
+                                    label_font_size = max(24, int(result_image.size[0] / 30))
+                                    font_paths = [
+                                        "arial.ttf",
+                                        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                                        "/System/Library/Fonts/Helvetica.ttc",
+                                        "C:/Windows/Fonts/arial.ttf"
+                                    ]
+                                    label_font = None
+                                    for font_path in font_paths:
+                                        try:
+                                            label_font = ImageFont.truetype(font_path, label_font_size)
+                                            break
+                                        except:
+                                            continue
+                                except:
+                                    label_font = None
+                                
+                                # Calcular tamaño del texto
+                                text_bbox = draw.textbbox((0, 0), person_label, font=label_font) if label_font else draw.textbbox((0, 0), person_label)
+                                text_width = text_bbox[2] - text_bbox[0]
+                                text_height = text_bbox[3] - text_bbox[1]
+                                
+                                # Posición usando keypoints de la cabeza (más cerca del esqueleto)
+                                head_keypoints = keypoints[:5]  # nariz, ojos, orejas
+                                head_confidences = confidences[:5]
+                                valid_head = [kp for kp, conf in zip(head_keypoints, head_confidences) if not np.isnan(kp[0]) and not np.isnan(kp[1]) and conf > 0]
+                                if valid_head:
+                                    head_center = np.mean(valid_head, axis=0)
+                                    label_x = max(0, int(head_center[0] - text_width / 2))
+                                    label_y = max(0, int(head_center[1] - text_height - 8))
+                                else:
+                                    # Fallback al bbox si no hay keypoints de cabeza
+                                    label_x = max(0, int((x_min + x_max) / 2 - text_width / 2))
+                                    label_y = max(0, int(y_min) - text_height - 4)
+                                
+                                # Fondo para el texto
+                                draw.rectangle(
+                                    [(label_x - 2, label_y - 2), (label_x + text_width + 2, label_y + text_height + 2)],
+                                    fill=(40, 40, 40),
+                                    outline=(255, 255, 255),
+                                    width=2
+                                )
+                                
+                                # Dibujar texto del ID
+                                draw.text(
+                                    (label_x, label_y),
+                                    person_label,
+                                    fill=(255, 255, 255),
+                                    font=label_font
+                                )
+                            
                             # Actualizar total de sentadillas (sumar todas las sentadillas de todas las personas)
-                            # Usar el máximo de sentadillas contadas por cualquier persona en este frame
                             for person_id in person_states:
                                 total_squats = max(total_squats, person_states[person_id]['squat_count'])
                             
                             # Dibujar conteo en la imagen
-                            result_image = draw_squat_count(result_image, total_squats, is_any_squat_down)
+                            # Si hay más de una persona, usar persons_data; si no, mantener comportamiento original
+                            if len(persons_data_list) > 1:
+                                result_image = draw_squat_count(result_image, total_squats, is_any_squat_down, persons_data_list)
+                            else:
+                                # Comportamiento original para una sola persona
+                                single_squat_count = persons_data_list[0]['squat_count'] if persons_data_list else total_squats
+                                single_is_down = persons_data_list[0]['is_squat_down'] if persons_data_list else is_any_squat_down
+                                result_image = draw_squat_count(result_image, single_squat_count, single_is_down, None)
                             
                             # Convertir PIL a OpenCV
                             result_np = np.array(result_image)
@@ -1080,14 +1452,26 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
                     )
                     
                     if result_image is not None and persons_details:
-                        max_squats_in_frame = 0
+                        # Obtener bboxes para tracking
+                        current_bboxes = [person_detail['bbox'] for person_detail in persons_details]
+                        
+                        # Hacer tracking de personas
+                        person_assignments, person_centroids = track_persons(
+                            current_bboxes, person_centroids, max_distance=150
+                        )
+                        
+                        # Procesar cada persona detectada
+                        persons_data_list = []
                         is_any_squat_down = False
                         
                         for person_idx, person_detail in enumerate(persons_details):
                             keypoints = np.array(person_detail['keypoints'])
                             confidences = np.array(person_detail['confidences'])
                             
-                            person_id = person_idx
+                            # Obtener ID de persona usando tracking
+                            person_id = person_assignments.get(person_idx, person_idx)
+                            
+                            # Crear o actualizar estado para esta persona
                             if person_id not in person_states:
                                 person_states[person_id] = {
                                     'state': 'up',
@@ -1096,18 +1480,101 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
                                     'knee_y_avg': None
                                 }
                             
+                            # Detectar sentadilla
                             is_squat_down, person_states[person_id] = detect_squat(
                                 keypoints, confidences, person_states[person_id]
                             )
                             
-                            max_squats_in_frame = max(max_squats_in_frame, person_states[person_id]['squat_count'])
+                            # Agregar información de esta persona para dibujar
+                            persons_data_list.append({
+                                'person_id': person_id,
+                                'squat_count': person_states[person_id]['squat_count'],
+                                'is_squat_down': is_squat_down,
+                                'bbox': person_detail['bbox']
+                            })
+                            
                             if is_squat_down:
                                 is_any_squat_down = True
+                        
+                        # Dibujar ID de persona sobre cada persona en el video
+                        draw = ImageDraw.Draw(result_image)
+                        for person_idx, person_detail in enumerate(persons_details):
+                            person_id = person_assignments.get(person_idx, person_idx)
+                            bbox = person_detail['bbox']
+                            x_min, y_min, x_max, y_max = bbox
+                            keypoints = np.array(person_detail['keypoints'])
+                            confidences = np.array(person_detail['confidences'])
+                            
+                            # Texto del ID
+                            person_label = f"P{person_id+1}"
+                            
+                            # Fuente para el ID
+                            try:
+                                from PIL import ImageFont
+                                label_font_size = max(24, int(result_image.size[0] / 30))
+                                font_paths = [
+                                    "arial.ttf",
+                                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                                    "/System/Library/Fonts/Helvetica.ttc",
+                                    "C:/Windows/Fonts/arial.ttf"
+                                ]
+                                label_font = None
+                                for font_path in font_paths:
+                                    try:
+                                        label_font = ImageFont.truetype(font_path, label_font_size)
+                                        break
+                                    except:
+                                        continue
+                            except:
+                                label_font = None
+                            
+                            # Calcular tamaño del texto
+                            text_bbox = draw.textbbox((0, 0), person_label, font=label_font) if label_font else draw.textbbox((0, 0), person_label)
+                            text_width = text_bbox[2] - text_bbox[0]
+                            text_height = text_bbox[3] - text_bbox[1]
+                            
+                            # Posición usando keypoints de la cabeza (más cerca del esqueleto)
+                            head_keypoints = keypoints[:5]  # nariz, ojos, orejas
+                            head_confidences = confidences[:5]
+                            valid_head = [kp for kp, conf in zip(head_keypoints, head_confidences) if not np.isnan(kp[0]) and not np.isnan(kp[1]) and conf > 0]
+                            if valid_head:
+                                head_center = np.mean(valid_head, axis=0)
+                                label_x = max(0, int(head_center[0] - text_width / 2))
+                                label_y = max(0, int(head_center[1] - text_height - 8))
+                            else:
+                                # Fallback al bbox si no hay keypoints de cabeza
+                                label_x = max(0, int((x_min + x_max) / 2 - text_width / 2))
+                                label_y = max(0, int(y_min) - text_height - 4)
+                            
+                            # Fondo para el texto
+                            draw.rectangle(
+                                [(label_x - 2, label_y - 2), (label_x + text_width + 2, label_y + text_height + 2)],
+                                fill=(40, 40, 40),
+                                outline=(255, 255, 255),
+                                width=2
+                            )
+                            
+                            # Dibujar texto del ID
+                            draw.text(
+                                (label_x, label_y),
+                                person_label,
+                                fill=(255, 255, 255),
+                                font=label_font
+                            )
                         
                         # Actualizar total de sentadillas
                         for person_id in person_states:
                             total_squats = max(total_squats, person_states[person_id]['squat_count'])
-                        result_image = draw_squat_count(result_image, total_squats, is_any_squat_down)
+                        
+                        # Dibujar conteo en la imagen
+                        # Si hay más de una persona, usar persons_data; si no, mantener comportamiento original
+                        if len(persons_data_list) > 1:
+                            result_image = draw_squat_count(result_image, total_squats, is_any_squat_down, persons_data_list)
+                        else:
+                            # Comportamiento original para una sola persona
+                            single_squat_count = persons_data_list[0]['squat_count'] if persons_data_list else total_squats
+                            single_is_down = persons_data_list[0]['is_squat_down'] if persons_data_list else is_any_squat_down
+                            result_image = draw_squat_count(result_image, single_squat_count, single_is_down, None)
                         
                         result_np = np.array(result_image)
                         result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
@@ -1121,10 +1588,13 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
                     processed_count += 1
         
         progress_bar.progress(1.0)
-        status_text.text(f"✅ Procesamiento completado: {processed_count} frames procesados | Sentadillas totales: {total_squats}")
+        status_text.text(f"Procesamiento completado: {processed_count} frames procesados | Sentadillas totales: {total_squats}")
         
         # Calcular tiempo de inferencia
         inference_time = time.time() - start_time
+        
+        # Preparar diccionario con conteos por persona
+        person_squats = {person_id: state['squat_count'] for person_id, state in person_states.items()}
         
     except Exception as e:
         st.error(f"Error procesando video: {e}")
@@ -1133,7 +1603,7 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
         if output_path and os.path.exists(output_path):
             os.unlink(output_path)
         inference_time = time.time() - start_time
-        return None, 0, 0, 0, 0, 0, inference_time, 0
+        return None, 0, 0, 0, 0, 0, inference_time, 0, {}
     finally:
         if cap is not None:
             cap.release()
@@ -1142,7 +1612,7 @@ def process_video_squat_count(video_file, pose_model, detr_model, detr_processor
         if tfile and os.path.exists(tfile.name):
             os.unlink(tfile.name)
     
-    return output_path, total_frames, processed_count, fps, width, height, inference_time, total_squats
+    return output_path, total_frames, processed_count, fps, width, height, inference_time, total_squats, person_squats
 
 def process_video(video_file, pose_model, detr_model, detr_processor, device, conf,
                             point_size_multiplier=1.0, line_width_multiplier=1.0,
@@ -1218,10 +1688,10 @@ def process_video(video_file, pose_model, detr_model, detr_processor, device, co
         if target_resolution is None:
             # Si no se especifica resolución, usar la original
             width, height = orig_width, orig_height
-            st.info(f"⚡ Procesando a resolución original: {width}x{height}")
+            st.info(f"Procesando a resolución original: {width}x{height}")
         else:
             width, height = target_resolution
-            st.info(f"⚡ Optimización: Redimensionando de {orig_width}x{orig_height} a {width}x{height}")
+            st.info(f"Optimización: Redimensionando de {orig_width}x{orig_height} a {width}x{height}")
         
         # Crear video de salida
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
@@ -1332,7 +1802,7 @@ def process_video(video_file, pose_model, detr_model, detr_processor, device, co
                     processed_count += 1
         
         progress_bar.progress(1.0)
-        status_text.text(f"✅ Procesamiento completado: {processed_count} frames procesados")
+        status_text.text(f"Procesamiento completado: {processed_count} frames procesados")
         
         # Calcular tiempo de inferencia
         inference_time = time.time() - start_time
@@ -1359,7 +1829,7 @@ def main():
     # Header principal con diseño mejorado
     st.markdown("""
     <div class="main-header">
-        <h1>Multi-Person Pose Detection</h1>
+        <h1>Pose Recognition</h1>
         <p>Detección inteligente de poses humanas con IA avanzada</p>
     </div>
     """, unsafe_allow_html=True)
@@ -1369,7 +1839,7 @@ def main():
         st.markdown("### Diseño Visual")
         st.markdown("""
         <div class="card">
-        <strong>Visualización elegante del esqueleto humano</strong><br><br>
+        <strong>Visualización del esqueleto humano</strong><br><br>
         
         <strong>Verde:</strong> Brazo izquierdo<br>
         <strong>Amarillo:</strong> Brazo derecho<br>
@@ -1378,15 +1848,14 @@ def main():
         <strong>Rosa claro:</strong> Conexiones de cabeza<br><br>
         
         <em>Diseño colorido y profesional para una visualización clara de las poses detectadas.</em>
-        <em> Visualización con círculos negros para los puntos clave</em>
+        
+        <em> Visualización con círculos negros para los puntos clave. </em>
 
         </div>
         """, unsafe_allow_html=True)
         
         st.markdown("### Ajustes")
         
-        # Contenedor para el slider de líneas
-        st.markdown('<div class="slider-container">', unsafe_allow_html=True)
         line_width_multiplier = st.slider(
             "Grosor de líneas del esqueleto",
             min_value=0.1,
@@ -1395,7 +1864,6 @@ def main():
             step=0.1,
             help="Ajusta el grosor de las líneas del esqueleto"
         )
-        st.markdown('</div>', unsafe_allow_html=True)
         
         point_size_multiplier = st.slider(
             "Tamaño de puntos",
@@ -1433,103 +1901,302 @@ def main():
     
     if mode == "Análisis de Imagen":
         
-        col1, col2 = st.columns([1, 1])
+        st.markdown("""
+        <div class="card">
+            <h3>Análisis de Imagen</h3>
+            <p>Analiza imágenes estáticas para detectar y visualizar poses humanas con precisión avanzada.</p>
+            <p><strong>Características:</strong></p>
+            <ul>
+                <li>Detección multi-persona usando modelos DETR y pose estimation</li>
+                <li>Visualización detallada del esqueleto con keypoints</li>
+                <li>Soporte para múltiples formatos de imagen (JPG, PNG, BMP)</li>
+                <li>Análisis rápido y preciso con estadísticas de detección</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
         
-        with col1:
-            st.markdown("#### Subir Imagen")
-            uploaded_file = st.file_uploader(
-                "Selecciona una imagen",
-                type=['jpg', 'jpeg', 'png', 'bmp'],
-                help="Formatos soportados: JPG, JPEG, PNG, BMP"
-            )
-            
-            if uploaded_file is not None:
-                # Mostrar imagen original
-                image = Image.open(uploaded_file).convert("RGB")
-                st.image(image, caption="Imagen Original", width='stretch')
-                show_image_metrics(image)
+        st.markdown("""
+        <div class="instructions-card">
+            <h4>Instrucciones de uso</h4>
+            <ol>
+                <li>Sube una imagen desde tu dispositivo</li>
+                <li>Selecciona el formato (JPG, JPEG, PNG, BMP)</li>
+                <li>Presiona "Analizar Pose" para procesar la imagen</li>
+                <li>Descarga el resultado con las poses detectadas</li>
+            </ol>
+        </div>
+        """, unsafe_allow_html=True)
         
-        with col2:
-            st.markdown("#### Resultado")
+        st.markdown("""
+        <div class="recommendations-card">
+            <h4>Recomendaciones</h4>
+            <ul>
+                <li>Imágenes con buena resolución para mejor detección</li>
+                <li>Personas completamente visibles en el marco</li>
+                <li>Buena iluminación para mayor precisión</li>
+                <li>Fondo simple facilita la detección</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("#### Subir Imagen")
+        uploaded_file = st.file_uploader(
+            "Selecciona una imagen",
+            type=['jpg', 'jpeg', 'png', 'bmp'],
+            help="Formatos soportados: JPG, JPEG, PNG, BMP"
+        )
+        
+        if uploaded_file is not None:
+            # Mostrar imagen original
+            image = Image.open(uploaded_file).convert("RGB")
+            st.image(image, caption="Imagen Original", width='stretch')
+            show_image_metrics(image)
             
-            if uploaded_file is not None:
-                if st.button("Analizar Pose", key="analyze_image"):
-                    process_and_show_pose(
+            if st.button("Analizar Pose", key="analyze_image", type="primary"):
+                # Guardar resultado en session state
+                start_time = time.time()
+                with st.spinner("Procesando imagen..."):
+                    result_image, person_count, persons_details = infer_multi_person_pose(
                         image, pose_model, detr_model, detr_processor, device, conf,
-                        point_size_multiplier, line_width_multiplier, detr_threshold,
-                        uploaded_file.name, "Procesando imagen..."
+                        point_size_multiplier, line_width_multiplier, detr_threshold
                     )
-            else:
-                st.markdown("""
-                <div class=\"camera-container\">
-                    <h4>Sube una imagen para comenzar</h4>
+                    
+                    if result_image is not None:
+                        inference_time = time.time() - start_time
+                        st.session_state['image_result'] = {
+                            'original_image': image,
+                            'result_image': result_image,
+                            'person_count': person_count,
+                            'file_name': uploaded_file.name,
+                            'inference_time': inference_time
+                        }
+                    else:
+                        st.error("No se pudo procesar la imagen")
+                        st.session_state['image_result'] = None
+            
+            # Mostrar resultado si existe
+            if 'image_result' in st.session_state and st.session_state['image_result'] is not None:
+                result_data = st.session_state['image_result']
+                original_image = result_data['original_image']
+                result_image = result_data['result_image']
+                person_count = result_data['person_count']
+                file_name = result_data['file_name']
+                inference_time = result_data['inference_time']
+                
+                st.markdown("#### Comparación: Original vs Resultado")
+                # Mostrar ambas imágenes lado a lado
+                show_images_side_by_side(original_image, result_image, "Imagen Original", "Pose Detection Result")
+                
+                # Estadísticas
+                st.markdown(f"""
+                <div class=\"metric-card\">
+                    <div class=\"metric-value\">{person_count}</div>
+                    <div class=\"metric-label\">personas detectadas</div>
                 </div>
                 """, unsafe_allow_html=True)
+                
+                # Mostrar tiempo de inferencia
+                minutes = int(inference_time // 60)
+                seconds = int(inference_time % 60)
+                milliseconds = int((inference_time % 1) * 1000)
+                
+                if minutes > 0:
+                    time_str = f"{minutes}m {seconds}s {milliseconds}ms"
+                else:
+                    time_str = f"{seconds}s {milliseconds}ms"
+                
+                st.markdown(f"""
+                <div class=\"metric-card\" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                    <div class=\"metric-value\">{time_str}</div>
+                    <div class=\"metric-label\">Tiempo de inferencia</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Opción de descarga
+                buf = io.BytesIO()
+                result_image.save(buf, format="PNG")
+                byte_im = buf.getvalue()
+                
+                st.download_button(
+                    label="Descargar Resultado",
+                    data=byte_im,
+                    file_name=f"pose_result_{file_name}.png",
+                    mime="image/png"
+                )
     
     elif mode == "Tomar Foto":
         
-        col1, col2 = st.columns([1, 1])
+        st.markdown("""
+        <div class="card">
+            <h3>Tomar Foto</h3>
+            <p>Captura fotos en tiempo real usando tu cámara web y analiza las poses humanas instantáneamente.</p>
+            <p><strong>Características:</strong></p>
+            <ul>
+                <li>Captura de fotos en tiempo real desde la cámara</li>
+                <li>Análisis inmediato de poses después de la captura</li>
+                <li>Interfaz intuitiva con vista previa de la foto</li>
+                <li>Opción para limpiar y tomar nuevas fotos fácilmente</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
         
-        with col1:
-            st.markdown("#### Capturar Foto")
-            
-            # Widget de cámara de Streamlit
+        st.markdown("""
+        <div class="instructions-card">
+            <h4>Instrucciones de uso</h4>
+            <ol>
+                <li>Haz clic en "Toma una foto"</li>
+                <li>Permite el acceso a la cámara cuando se solicite</li>
+                <li>Posiciona la persona en el marco de la cámara</li>
+                <li>Presiona "Analizar Pose" para procesar la foto</li>
+            </ol>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="recommendations-card">
+            <h4>Consejos</h4>
+            <ul>
+                <li>Buena iluminación mejora la calidad de detección</li>
+                <li>Asegúrate de que la persona esté completamente visible</li>
+                <li>Un fondo simple facilita la detección</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("#### Capturar Foto")
+        
+        # Verificar si hay una foto guardada en session_state
+        if 'camera_image' not in st.session_state or st.session_state['camera_image'] is None:
+            # Widget de cámara de Streamlit (solo se muestra si no hay foto guardada)
             camera_photo = st.camera_input("Toma una foto para analizar la pose")
             
             if camera_photo is not None:
-                # Convertir la foto a PIL Image
+                # Convertir la foto a PIL Image y guardarla en session_state
                 image = Image.open(camera_photo).convert("RGB")
-                
-                # Mostrar imagen capturada
-                st.image(image, caption="Foto Capturada", width='stretch')
-                show_image_metrics(image)
-                
-                # Botón de análisis en la misma columna
-                if st.button("Analizar Pose", key="analyze_camera_photo"):
-                    file_name = f"camera_{int(time.time())}"
-                    process_and_show_pose(
+                st.session_state['camera_image'] = image
+                st.rerun()  # Recargar para ocultar la cámara
+        else:
+            # Mostrar la foto capturada (sin el recuadro de la cámara)
+            image = st.session_state['camera_image']
+            st.image(image, caption="Foto Capturada", width='stretch')
+            show_image_metrics(image)
+            
+            # Botón para limpiar la foto y volver a tomar otra
+            if st.button("Limpiar Foto", key="clear_camera_photo"):
+                st.session_state['camera_image'] = None
+                if 'camera_result' in st.session_state:
+                    del st.session_state['camera_result']
+                st.rerun()
+            
+            # Mostrar botón de análisis si hay foto capturada
+            if st.button("Analizar Pose", key="analyze_camera_photo", type="primary"):
+                file_name = f"camera_{int(time.time())}"
+                # Procesar y guardar resultado en session state
+                start_time = time.time()
+                with st.spinner("Procesando foto..."):
+                    result_image, person_count, persons_details = infer_multi_person_pose(
                         image, pose_model, detr_model, detr_processor, device, conf,
-                        point_size_multiplier, line_width_multiplier, detr_threshold,
-                        file_name, "Procesando foto..."
+                        point_size_multiplier, line_width_multiplier, detr_threshold
                     )
-            else:
-                st.markdown("""
-                <div class=\"camera-container\">
-                    <h4>Toma una foto para comenzar</h4>
+                    
+                    if result_image is not None:
+                        inference_time = time.time() - start_time
+                        st.session_state['camera_result'] = {
+                            'original_image': image,
+                            'result_image': result_image,
+                            'person_count': person_count,
+                            'file_name': file_name,
+                            'inference_time': inference_time
+                        }
+                    else:
+                        st.error("No se pudo procesar la imagen")
+                        st.session_state['camera_result'] = None
+            
+            # Mostrar resultado si existe
+            if 'camera_result' in st.session_state and st.session_state['camera_result'] is not None:
+                result_data = st.session_state['camera_result']
+                original_image = result_data['original_image']
+                result_image = result_data['result_image']
+                person_count = result_data['person_count']
+                file_name = result_data['file_name']
+                inference_time = result_data['inference_time']
+                
+                st.markdown("#### Comparación: Original vs Resultado")
+                # Mostrar ambas imágenes lado a lado
+                show_images_side_by_side(original_image, result_image, "Foto Capturada", "Pose Detection Result")
+                
+                # Estadísticas
+                st.markdown(f"""
+                <div class=\"metric-card\">
+                    <div class=\"metric-value\">{person_count}</div>
+                    <div class=\"metric-label\">personas detectadas</div>
                 </div>
                 """, unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("#### Instrucciones")
-            st.markdown("""
-            <div class=\"camera-container\">
-                <h4>Cómo usar la cámara</h4>
-                <ol>
-                    <li>Haz clic en "Toma una foto"</li>
-                    <li>Permite el acceso a la cámara</li>
-                    <li>Posiciona la persona en el marco</li>
-                    <li>Presiona "Analizar Pose"</li>
-                </ol>
-                <p><strong>Consejos:</strong></p>
-                <ul>
-                    <li>Buena iluminación</li>
-                    <li>Persona completa visible</li>
-                    <li>Fondo simple</li>
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
+                
+                # Mostrar tiempo de inferencia
+                minutes = int(inference_time // 60)
+                seconds = int(inference_time % 60)
+                milliseconds = int((inference_time % 1) * 1000)
+                
+                if minutes > 0:
+                    time_str = f"{minutes}m {seconds}s {milliseconds}ms"
+                else:
+                    time_str = f"{seconds}s {milliseconds}ms"
+                
+                st.markdown(f"""
+                <div class=\"metric-card\" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                    <div class=\"metric-value\">{time_str}</div>
+                    <div class=\"metric-label\">Tiempo de inferencia</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Opción de descarga
+                buf = io.BytesIO()
+                result_image.save(buf, format="PNG")
+                byte_im = buf.getvalue()
+                
+                st.download_button(
+                    label="Descargar Resultado",
+                    data=byte_im,
+                    file_name=f"pose_result_{file_name}.png",
+                    mime="image/png"
+                )
     
     elif mode == "Análisis de Video":
         
         st.markdown("""
         <div class="card">
-            <h3>⚡ Análisis de Video</h3>
-            <p>Procesa videos de forma optimizada usando técnicas avanzadas de optimización para detectar poses humanas.</p>
+            <h3>Análisis de Video</h3>
+            <p>Procesa videos para detectar poses humanas.</p>
             <p><strong>Optimizaciones aplicadas:</strong></p>
             <ul>
                 <li>Frame skipping: Procesa solo cada N frames</li>
                 <li>Resolución reducida: Procesa a menor resolución para mayor velocidad</li>
                 <li>Procesamiento eficiente: Optimizado para reducir tiempo de espera</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="instructions-card">
+            <h4>Instrucciones de uso</h4>
+            <ol>
+                <li>Sube un video desde tu dispositivo (MP4, AVI, MOV, MKV, WEBM)</li>
+                <li>Configura las opciones de procesamiento (frame skip, resolución, límite de frames)</li>
+                <li>Presiona "Procesar Video" para analizar el video</li>
+                <li>Descarga el video procesado con las poses detectadas</li>
+            </ol>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="recommendations-card">
+            <h4>Recomendaciones</h4>
+            <ul>
+                <li>Selecciona una resolución más baja (360p o 480p) para procesamiento más rápido</li>
+                <li>Usa frame skip (2-5) para videos largos y reducir tiempo de procesamiento</li>
+                <li>Videos con buena iluminación y personas completamente visibles</li>
+                <li>Fondo simple mejora la precisión de detección</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -1550,7 +2217,7 @@ def main():
                 st.video(uploaded_video)
                 
                 # Configuración de procesamiento optimizado
-                st.markdown("#### ⚡ Configuración Optimizada")
+                st.markdown("#### Configuración")
                 
                 frame_skip = st.slider(
                     "Procesar cada N frames",
@@ -1561,28 +2228,63 @@ def main():
                     key="frame_skip"
                 )
                 
-                # Opción de resolución para procesamiento más rápido
+                # Selector de orientación del video (lista desplegable)
+                video_orientation = st.selectbox(
+                    "Orientación del video",
+                    options=["Horizontal", "Vertical"],
+                    index=0,
+                    help="Selecciona si el video fue grabado en horizontal o vertical",
+                    key="video_orientation"
+                )
+                
+                # Opción de resolución según orientación (lista desplegable)
+                if video_orientation == "Horizontal":
+                    resolution_options = ["360p (640x360)", "480p (854x480)", "720p (1280x720)", "1080p (1920x1080)", "Original"]
+                    resolution_map = {
+                        "Original": None,
+                        "1080p (1920x1080)": (1920, 1080),
+                        "720p (1280x720)": (1280, 720),
+                        "480p (854x480)": (854, 480),
+                        "360p (640x360)": (640, 360)
+                    }
+                else:  # Vertical
+                    resolution_options = ["360p (360x640)", "480p (480x854)", "720p (720x1280)", "1080p (1080x1920)", "Original"]
+                    resolution_map = {
+                        "Original": None,
+                        "1080p (1080x1920)": (1080, 1920),
+                        "720p (720x1280)": (720, 1280),
+                        "480p (480x854)": (480, 854),
+                        "360p (360x640)": (360, 640)
+                    }
+                
+                # Resetear el índice si cambió la orientación
+                if "resolution_option" not in st.session_state or st.session_state.get("last_orientation") != video_orientation:
+                    default_index = 0
+                    st.session_state["last_orientation"] = video_orientation
+                else:
+                    # Intentar mantener la selección anterior si existe en las nuevas opciones
+                    try:
+                        current_option = st.session_state.get("resolution_option", resolution_options[0])
+                        default_index = resolution_options.index(current_option) if current_option in resolution_options else 0
+                    except:
+                        default_index = 0
+                
                 resolution_option = st.selectbox(
                     "Resolución de procesamiento",
-                    ["360p (640x360)", "480p (854x480)", "720p (1280x720)", "1080p (1920x1080)", "Original"],
-                    index=0,  # Por defecto 360p para máxima velocidad
+                    options=resolution_options,
+                    index=default_index,
                     help="Resoluciones más bajas = procesamiento más rápido. Recomendado: 360p o 480p para mejor velocidad.",
                     key="resolution_option"
                 )
                 
                 # Obtener resolución objetivo
-                resolution_map = {
-                    "Original": None,
-                    "1080p (1920x1080)": (1920, 1080),
-                    "720p (1280x720)": (1280, 720),
-                    "480p (854x480)": (854, 480),
-                    "360p (640x360)": (640, 360)
-                }
                 target_resolution = resolution_map[resolution_option]
                 
+                # Límite de frames (lista desplegable)
                 max_frames_option = st.selectbox(
                     "Límite de frames (opcional)",
-                    ["Todos los frames", "50 frames", "100 frames", "200 frames"],
+                    options=["Todos los frames", "50 frames", "100 frames", "200 frames"],
+                    index=0,
                     help="Limita el número de frames a procesar para videos largos",
                     key="max_frames_option"
                 )
@@ -1596,7 +2298,7 @@ def main():
                 max_frames = max_frames_map[max_frames_option]
                 
                 st.success(f"""
-                **⚡ Configuración Optimizada:**
+                **Configuración Optimizada:**
                 - Frame skip: {frame_skip} (procesa 1 de cada {frame_skip} frames)
                 - Resolución: {resolution_option}
                 - Límite: {max_frames_option}
@@ -1608,11 +2310,11 @@ def main():
             st.markdown("#### Resultado")
             
             if uploaded_video is not None:
-                if st.button("⚡ Procesar Video", key="process_video", type="primary"):
+                if st.button("Procesar Video", key="process_video", type="primary"):
                     # Resetear el stream del archivo
                     uploaded_video.seek(0)
                     
-                    with st.spinner("⚡ Procesando video con optimizaciones... Esto puede tardar unos minutos."):
+                    with st.spinner("Procesando video con optimizaciones... Esto puede tardar unos minutos."):
                         try:
                             # Crear un BytesIO wrapper para el archivo
                             video_bytes_io = io.BytesIO(uploaded_video.read())
@@ -1673,19 +2375,12 @@ def main():
                             st.error(f"Error procesando el video: {e}")
                             import traceback
                             st.code(traceback.format_exc())
-            else:
-                st.markdown("""
-                <div class=\"camera-container\">
-                    <h4>Sube un video para comenzar</h4>
-                    <p>Selecciona un video desde tu dispositivo para analizar las poses con la versión optimizada</p>
-                </div>
-                """, unsafe_allow_html=True)
     
     elif mode == "Conteo de sentadillas":
         
         st.markdown("""
         <div class="card">
-            <h3>🏋️ Conteo de Sentadillas</h3>
+            <h3>Conteo de Sentadillas</h3>
             <p>Analiza videos de ejercicios y cuenta automáticamente las sentadillas realizadas en tiempo real.</p>
             <p><strong>Características:</strong></p>
             <ul>
@@ -1693,6 +2388,30 @@ def main():
                 <li>Conteo en tiempo real durante el procesamiento</li>
                 <li>Visualización del esqueleto con keypoints</li>
                 <li>Indicador visual de estado (BAJANDO/SUBIENDO)</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="instructions-card">
+            <h4>Instrucciones de uso</h4>
+            <ol>
+                <li>Sube un video con ejercicios de sentadillas desde tu dispositivo</li>
+                <li>Configura las opciones de procesamiento según tus necesidades</li>
+                <li>Presiona "Procesar Video" para analizar y contar sentadillas</li>
+                <li>Revisa el conteo total y descarga el video procesado</li>
+            </ol>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div class="recommendations-card">
+            <h4>Recomendaciones</h4>
+            <ul>
+                <li>Persona completamente visible en el video</li>
+                <li>Buena iluminación para mejor detección</li>
+                <li>Fondo simple facilita el seguimiento</li>
+                <li>Vista lateral o frontal de la persona para mejor precisión</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -1713,7 +2432,7 @@ def main():
                 st.video(uploaded_video)
                 
                 # Configuración de procesamiento
-                st.markdown("#### ⚙️ Configuración")
+                st.markdown("#### Configuración")
                 
                 frame_skip = st.slider(
                     "Procesar cada N frames",
@@ -1724,28 +2443,63 @@ def main():
                     key="frame_skip_squat"
                 )
                 
-                # Opción de resolución para procesamiento más rápido
+                # Selector de orientación del video (lista desplegable)
+                video_orientation = st.selectbox(
+                    "Orientación del video",
+                    options=["Horizontal", "Vertical"],
+                    index=0,
+                    help="Selecciona si el video fue grabado en horizontal o vertical",
+                    key="video_orientation_squat"
+                )
+                
+                # Opción de resolución según orientación (lista desplegable)
+                if video_orientation == "Horizontal":
+                    resolution_options = ["360p (640x360)", "480p (854x480)", "720p (1280x720)", "1080p (1920x1080)", "Original"]
+                    resolution_map = {
+                        "Original": None,
+                        "1080p (1920x1080)": (1920, 1080),
+                        "720p (1280x720)": (1280, 720),
+                        "480p (854x480)": (854, 480),
+                        "360p (640x360)": (640, 360)
+                    }
+                else:  # Vertical
+                    resolution_options = ["360p (360x640)", "480p (480x854)", "720p (720x1280)", "1080p (1080x1920)", "Original"]
+                    resolution_map = {
+                        "Original": None,
+                        "1080p (1080x1920)": (1080, 1920),
+                        "720p (720x1280)": (720, 1280),
+                        "480p (480x854)": (480, 854),
+                        "360p (360x640)": (360, 640)
+                    }
+                
+                # Resetear el índice si cambió la orientación
+                if "resolution_option_squat" not in st.session_state or st.session_state.get("last_orientation_squat") != video_orientation:
+                    default_index = 0
+                    st.session_state["last_orientation_squat"] = video_orientation
+                else:
+                    # Intentar mantener la selección anterior si existe en las nuevas opciones
+                    try:
+                        current_option = st.session_state.get("resolution_option_squat", resolution_options[0])
+                        default_index = resolution_options.index(current_option) if current_option in resolution_options else 0
+                    except:
+                        default_index = 0
+                
                 resolution_option = st.selectbox(
                     "Resolución de procesamiento",
-                    ["360p (640x360)", "480p (854x480)", "720p (1280x720)", "1080p (1920x1080)", "Original"],
-                    index=0,  # Por defecto 360p para máxima velocidad
+                    options=resolution_options,
+                    index=default_index,
                     help="Resoluciones más bajas = procesamiento más rápido. Recomendado: 360p o 480p para mejor velocidad.",
                     key="resolution_option_squat"
                 )
                 
                 # Obtener resolución objetivo
-                resolution_map = {
-                    "Original": None,
-                    "1080p (1920x1080)": (1920, 1080),
-                    "720p (1280x720)": (1280, 720),
-                    "480p (854x480)": (854, 480),
-                    "360p (640x360)": (640, 360)
-                }
                 target_resolution = resolution_map[resolution_option]
                 
+                # Límite de frames (lista desplegable)
                 max_frames_option = st.selectbox(
                     "Límite de frames (opcional)",
-                    ["Todos los frames", "50 frames", "100 frames", "200 frames"],
+                    options=["Todos los frames", "50 frames", "100 frames", "200 frames"],
+                    index=0,
                     help="Limita el número de frames a procesar para videos largos",
                     key="max_frames_option_squat"
                 )
@@ -1759,29 +2513,29 @@ def main():
                 max_frames = max_frames_map[max_frames_option]
                 
                 st.info(f"""
-                **⚙️ Configuración:**
+                **Configuración:**
                 - Frame skip: {frame_skip} (procesa 1 de cada {frame_skip} frames)
                 - Resolución: {resolution_option}
                 - Límite: {max_frames_option}
                 
-                **💡 Consejo:** Asegúrate de que la persona esté completamente visible en el video para una mejor detección.
+                **Consejo:** Asegúrate de que la persona esté completamente visible en el video para una mejor detección.
                 """)
         
         with col2:
             st.markdown("#### Resultado")
             
             if uploaded_video is not None:
-                if st.button("🏋️ Procesar Video", key="process_video_squat", type="primary"):
+                if st.button("Procesar Video", key="process_video_squat", type="primary"):
                     # Resetear el stream del archivo
                     uploaded_video.seek(0)
                     
-                    with st.spinner("🏋️ Procesando video y contando sentadillas... Esto puede tardar unos minutos."):
+                    with st.spinner("Procesando video y contando sentadillas... Esto puede tardar unos minutos."):
                         try:
                             # Crear un BytesIO wrapper para el archivo
                             video_bytes_io = io.BytesIO(uploaded_video.read())
                             uploaded_video.seek(0)  # Resetear para mostrar el video original
                             
-                            output_path, total_frames, processed_frames, fps, width, height, inference_time, total_squats = process_video_squat_count(
+                            output_path, total_frames, processed_frames, fps, width, height, inference_time, total_squats, person_squats = process_video_squat_count(
                                 video_bytes_io,
                                 pose_model, detr_model, detr_processor, device, conf,
                                 point_size_multiplier, line_width_multiplier,
@@ -1822,12 +2576,25 @@ def main():
                                 """, unsafe_allow_html=True)
                                 
                                 # Mostrar TOTAL DE SENTADILLAS (destacado)
-                                st.markdown(f"""
-                                <div class=\"metric-card\" style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);">
-                                    <div class=\"metric-value\" style="font-size: 3rem;">{total_squats}</div>
-                                    <div class=\"metric-label\" style="font-size: 1.2rem;">Sentadillas Totales</div>
-                                </div>
-                                """, unsafe_allow_html=True)
+                                # Si hay una sola persona, mostrar como antes; si hay dos o más, mostrar cuadro por persona
+                                num_persons = len(person_squats) if person_squats else 0
+                                if num_persons <= 1:
+                                    # Una persona o ninguna: mostrar como está ahora
+                                    st.markdown(f"""
+                                    <div class=\"metric-card\" style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);">
+                                        <div class=\"metric-value\" style="font-size: 3rem;">{total_squats}</div>
+                                        <div class=\"metric-label\" style="font-size: 1.2rem;">Sentadillas Totales</div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                else:
+                                    # Dos o más personas: mostrar cuadro para cada una
+                                    for person_id, squat_count in sorted(person_squats.items()):
+                                        st.markdown(f"""
+                                        <div class=\"metric-card\" style="background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);">
+                                            <div class=\"metric-value\" style="font-size: 3rem;">{squat_count}</div>
+                                            <div class=\"metric-label\" style="font-size: 1.2rem;">Sentadillas Totales - Persona {person_id+1}</div>
+                                        </div>
+                                        """, unsafe_allow_html=True)
                                 
                                 # Opción de descarga
                                 st.download_button(
@@ -1844,20 +2611,6 @@ def main():
                             st.error(f"Error procesando el video: {e}")
                             import traceback
                             st.code(traceback.format_exc())
-            else:
-                st.markdown("""
-                <div class=\"camera-container\">
-                    <h4>Sube un video para comenzar</h4>
-                    <p>Selecciona un video con ejercicios de sentadillas para contar automáticamente las repeticiones</p>
-                    <p><strong>Recomendaciones:</strong></p>
-                    <ul style="text-align: left; display: inline-block;">
-                        <li>Persona completamente visible</li>
-                        <li>Buena iluminación</li>
-                        <li>Fondo simple</li>
-                        <li>Vista lateral o frontal</li>
-                    </ul>
-                </div>
-                """, unsafe_allow_html=True)
               
     # Footer
     st.markdown("---")
