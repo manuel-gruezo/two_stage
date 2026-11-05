@@ -47,5 +47,4 @@ USER appuser
 EXPOSE 8501
 
 # Si tu app es Streamlit
-CMD ["streamlit", "run", "start_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
-
+CMD ["streamlit", "run", "start_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"
